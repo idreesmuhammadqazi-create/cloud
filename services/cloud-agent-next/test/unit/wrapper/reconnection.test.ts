@@ -164,11 +164,13 @@ const createMockKiloClient = (overrides?: Partial<WrapperKiloClient>): WrapperKi
   getSessionStatuses: vi.fn().mockResolvedValue({}),
   getQuestions: vi.fn().mockResolvedValue([]),
   getPermissions: vi.fn().mockResolvedValue([]),
+  getNetworkWaits: vi.fn().mockResolvedValue([]),
+  resumeNetworkWait: vi.fn().mockResolvedValue(true),
   sdkClient: {
     event: {
-      // Return a stream that never yields — keeps event subscription alive
+      // Return a stream that connects, then never yields again.
       subscribe: vi.fn().mockResolvedValue({
-        stream: createEventStream([]),
+        stream: createEventStream([{ type: 'server.connected' }]),
       }),
     },
   } as unknown as WrapperKiloClient['sdkClient'],
@@ -626,6 +628,7 @@ describe('ingest WS reconnection', () => {
   it('returns false from isConnected during reconnection', async () => {
     const manager = createManager();
     await openConnection(manager);
+    await vi.advanceTimersByTimeAsync(0);
 
     // Initially connected
     expect(manager.isConnected()).toBe(true);

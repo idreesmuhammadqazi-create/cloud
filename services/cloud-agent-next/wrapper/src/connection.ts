@@ -151,7 +151,7 @@ export function createConnectionManager(
   callbacks: ConnectionCallbacks
 ): ConnectionManager {
   let ingestWs: WebSocket | null = null;
-  let eventSubscriptionActive = false;
+  let eventSubscriptionListening = false;
   let eventSubscriptionGeneration = 0;
   let eventSubscriptionAbort: AbortController | null = null;
 
@@ -208,6 +208,32 @@ export function createConnectionManager(
     bufferOverflowed = false;
   }
 
+  async function resumeNetworkWait(requestID: string): Promise<void> {
+    try {
+      await config.kiloClient.resumeNetworkWait(requestID);
+      logToFile(`resumed network wait ${requestID}`);
+    } catch (err) {
+      logToFile(
+        `failed to resume network wait ${requestID}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  async function resumeRestoredNetworkWaits(): Promise<void> {
+    const kiloSessionId = state.currentJob?.kiloSessionId;
+    if (!kiloSessionId) {
+      logToFile('skipping restored network resume: no kiloSessionId');
+      return;
+    }
+
+    const networkWaits = await config.kiloClient.getNetworkWaits();
+    await Promise.all(
+      networkWaits
+        .filter(wait => wait.sessionID === kiloSessionId && wait.restored)
+        .map(wait => resumeNetworkWait(wait.id))
+    );
+  }
+
   /**
    * Fetch current kilo server state and send it as regular kilocode events to the DO.
    * Called after ingest WS opens (initial connect and reconnect).
@@ -221,10 +247,11 @@ export function createConnectionManager(
         return;
       }
 
-      const [statuses, questions, permissions] = await Promise.all([
+      const [statuses, questions, permissions, networkWaits] = await Promise.all([
         config.kiloClient.getSessionStatuses(),
         config.kiloClient.getQuestions(),
         config.kiloClient.getPermissions(),
+        config.kiloClient.getNetworkWaits(),
       ]);
 
       const statusEntry = statuses[kiloSessionId];
@@ -235,6 +262,7 @@ export function createConnectionManager(
 
       const pendingQuestion = questions.find(q => q.sessionID === kiloSessionId);
       const pendingPermission = permissions.find(p => p.sessionID === kiloSessionId);
+      const pendingNetworkWaits = networkWaits.filter(wait => wait.sessionID === kiloSessionId);
       const codeReviewJob = isCodeReviewJob(state);
       const skipStatusForCodeReview = codeReviewJob && isInteractiveStatusType(sessionStatus.type);
 
@@ -277,9 +305,21 @@ export function createConnectionManager(
           timestamp: new Date().toISOString(),
         });
       }
+      for (const wait of pendingNetworkWaits) {
+        if (wait.restored) continue;
+        sendToIngest({
+          streamEventType: 'kilocode',
+          data: {
+            event: 'session.network.asked',
+            type: 'session.network.asked',
+            properties: wait,
+          },
+          timestamp: new Date().toISOString(),
+        });
+      }
 
       logToFile(
-        `kilo state sent: status=${sessionStatus.type}${skipStatusForCodeReview ? ' (suppressed)' : ''}, question=${pendingQuestion?.id ?? 'none'}${codeReviewJob && pendingQuestion ? ' (suppressed)' : ''}, permission=${pendingPermission?.id ?? 'none'}${codeReviewJob && pendingPermission ? ' (suppressed)' : ''}`
+        `kilo state sent: status=${sessionStatus.type}${skipStatusForCodeReview ? ' (suppressed)' : ''}, question=${pendingQuestion?.id ?? 'none'}${codeReviewJob && pendingQuestion ? ' (suppressed)' : ''}, permission=${pendingPermission?.id ?? 'none'}${codeReviewJob && pendingPermission ? ' (suppressed)' : ''}, networkWaits=${pendingNetworkWaits.length}`
       );
     } catch (err) {
       logToFile(
@@ -426,20 +466,47 @@ export function createConnectionManager(
     return `Insufficient credits: ${eventType}`;
   }
 
+  function maybeResumeNetworkWait(eventType: string, properties: Record<string, unknown>): void {
+    if (eventType !== 'session.network.restored') return;
+
+    const currentSessionId = state.currentJob?.kiloSessionId;
+    const sessionID = typeof properties.sessionID === 'string' ? properties.sessionID : undefined;
+    if (!currentSessionId || sessionID !== currentSessionId) return;
+
+    const requestID = typeof properties.requestID === 'string' ? properties.requestID : undefined;
+    if (!requestID) {
+      logToFile('session.network.restored without requestID — ignoring');
+      return;
+    }
+
+    // Keep forwarding the restored event to ingest; this only unblocks the local Kilo wait.
+    void resumeNetworkWait(requestID);
+  }
+
   /**
    * Start the SDK event subscription. Runs in the background.
    * Replaces the old SSE consumer with a typed event stream from the SDK.
    */
-  function startEventSubscription(): void {
+  function startEventSubscription(): Promise<boolean> {
     // Abort the previous subscription's HTTP stream (if any) before starting
     // a new one.  This ensures the old `for await` loop unblocks immediately
     // instead of lingering until the next server-sent event arrives.
     eventSubscriptionAbort?.abort();
 
     const myGeneration = ++eventSubscriptionGeneration;
-    eventSubscriptionActive = true;
+    eventSubscriptionListening = false;
     const abortController = new AbortController();
     eventSubscriptionAbort = abortController;
+    let resolveStarted: (started: boolean) => void = () => {};
+    let startedResolved = false;
+    const startedPromise = new Promise<boolean>(resolve => {
+      resolveStarted = resolve;
+    });
+    const markStarted = (started: boolean): void => {
+      if (startedResolved) return;
+      startedResolved = true;
+      resolveStarted(started);
+    };
 
     // Store connections in state for external reference
     if (ingestWs) {
@@ -459,12 +526,12 @@ export function createConnectionManager(
         });
         if (!result.stream) {
           logToFile('No event stream returned from SDK');
-          eventSubscriptionActive = false;
+          markStarted(false);
           callbacks.onDisconnect('No event stream from SDK');
           return;
         }
 
-        logToFile('SDK event subscription started');
+        logToFile('SDK event subscription stream returned');
 
         for await (const event of result.stream) {
           if (abortController.signal.aborted || myGeneration !== eventSubscriptionGeneration) break;
@@ -479,6 +546,9 @@ export function createConnectionManager(
           state.updateActivity();
 
           if (eventType === 'server.connected') {
+            logToFile('SDK event subscription connected');
+            eventSubscriptionListening = true;
+            markStarted(true);
             callbacks.onSseEvent?.();
             continue;
           }
@@ -535,6 +605,8 @@ export function createConnectionManager(
               continue;
             }
           }
+
+          maybeResumeNetworkWait(eventType, properties);
 
           // Build and forward ingest event
           const untrimmedIngestEvent: IngestEvent = {
@@ -600,11 +672,14 @@ export function createConnectionManager(
           callbacks.onDisconnect(`SDK event stream error: ${msg}`);
         }
       } finally {
+        markStarted(false);
         if (myGeneration === eventSubscriptionGeneration) {
-          eventSubscriptionActive = false;
+          eventSubscriptionListening = false;
         }
       }
     })();
+
+    return startedPromise;
   }
 
   function attemptReconnect(): void {
@@ -625,6 +700,9 @@ export function createConnectionManager(
     }
     // Send fresh kilo state snapshot after reconnecting
     void sendKiloSnapshot();
+    if (eventSubscriptionListening) {
+      void resumeRestoredNetworkWaits();
+    }
     callbacks.onReconnected?.();
   }
 
@@ -690,11 +768,15 @@ export function createConnectionManager(
       // Open ingest WS first
       await openIngestWs();
 
-      // Send initial kilo state snapshot before starting event subscription
+      // Send initial kilo state snapshot
       await sendKiloSnapshot();
 
-      // Start SDK event subscription (runs in background)
-      startEventSubscription();
+      // Start SDK event subscription before resuming restored network waits.
+      const eventSubscriptionStarted = startEventSubscription();
+
+      void eventSubscriptionStarted.then(started => {
+        if (started) void resumeRestoredNetworkWaits();
+      });
 
       logToFile('connections opened');
     },
@@ -708,6 +790,7 @@ export function createConnectionManager(
       // loop unblocks immediately instead of waiting for the next SSE event.
       eventSubscriptionAbort?.abort();
       eventSubscriptionAbort = null;
+      eventSubscriptionListening = false;
 
       // Close ingest WS
       if (ingestWs) {
@@ -729,7 +812,9 @@ export function createConnectionManager(
     },
 
     isConnected: () => {
-      return ingestWs !== null && ingestWs.readyState === WebSocket.OPEN && eventSubscriptionActive;
+      return (
+        ingestWs !== null && ingestWs.readyState === WebSocket.OPEN && eventSubscriptionListening
+      );
     },
 
     isReconnecting: () => reconnecting,
@@ -738,7 +823,9 @@ export function createConnectionManager(
       logToFile('reconnecting SDK event subscription');
       // startEventSubscription() aborts the previous controller internally,
       // so no separate abort call is needed here.
-      startEventSubscription();
+      void startEventSubscription().then(started => {
+        if (started) void resumeRestoredNetworkWaits();
+      });
     },
 
     sendKiloSnapshot,
