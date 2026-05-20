@@ -1,6 +1,8 @@
 import 'server-only';
 
+import { TRPCError } from '@trpc/server';
 import { eq } from 'drizzle-orm';
+import { FIELD_KEY_TO_ENTRY, validateFieldValue } from '@kilocode/kiloclaw-secret-catalog';
 import { APP_URL } from '@/lib/constants';
 import { encryptKiloClawSecret } from '@/lib/kiloclaw/encryption';
 import { KiloClawInternalClient } from '@/lib/kiloclaw/kiloclaw-internal-client';
@@ -99,6 +101,27 @@ function hasComposioProvisionSecrets(secrets: Record<string, string> | undefined
   return secrets?.composioUserApiKey !== undefined || secrets?.composioOrg !== undefined;
 }
 
+function validateManualComposioProvisionSecrets(secrets: Record<string, string>): void {
+  for (const key of ['composioUserApiKey', 'composioOrg']) {
+    const value = secrets[key];
+    if (value === undefined) continue;
+    const entry = FIELD_KEY_TO_ENTRY.get(key);
+    const field = entry?.fields.find(candidate => candidate.key === key);
+    if (field?.maxLength != null && value.length > field.maxLength) {
+      throw new TRPCError({
+        code: 'BAD_REQUEST',
+        message: `${field.label} exceeds maximum length of ${field.maxLength} characters`,
+      });
+    }
+    if (!validateFieldValue(value, field?.validationPattern)) {
+      throw new TRPCError({
+        code: 'BAD_REQUEST',
+        message: field?.validationMessage ?? `Invalid value for ${key}`,
+      });
+    }
+  }
+}
+
 async function getReusableManagedComposioIdentityForProvision(params: {
   scope: ComposioOwnerScope;
   instanceId?: string | null;
@@ -119,12 +142,27 @@ export async function buildComposioProvisionSecrets(params: {
   scope: ComposioOwnerScope;
   instanceId?: string | null;
   secrets?: Record<string, string>;
+  skipIncompleteManagedConnection?: boolean;
 }): Promise<{
   secrets?: Record<string, string>;
   configToMark: ProvisionComposioConfigToMark;
 }> {
   if (hasComposioProvisionSecrets(params.secrets)) {
+    validateManualComposioProvisionSecrets(params.secrets ?? {});
     return { secrets: params.secrets, configToMark: { source: 'manual' } };
+  }
+
+  if (!params.instanceId) {
+    const pendingIdentity = await getActiveManagedComposioIdentity(params.scope);
+    if (pendingIdentity && !pendingIdentity.row.google_calendar_connected_account_id) {
+      if (params.skipIncompleteManagedConnection) {
+        return { secrets: params.secrets, configToMark: null };
+      }
+      throw new TRPCError({
+        code: 'CONFLICT',
+        message: 'Managed Composio connection is still completing',
+      });
+    }
   }
 
   const identity = await getReusableManagedComposioIdentityForProvision({
@@ -145,7 +183,7 @@ export async function buildComposioProvisionSecrets(params: {
 
 export async function completeManagedComposioGoogleCalendarConnection(params: {
   userId: string;
-  instance: ActiveKiloClawInstance;
+  instance: ActiveKiloClawInstance | null;
   scope: ComposioOwnerScope;
   connectedAccountId: string;
 }): Promise<boolean> {
@@ -162,6 +200,14 @@ export async function completeManagedComposioGoogleCalendarConnection(params: {
     account => account.id === params.connectedAccountId && account.status === 'ACTIVE'
   );
   if (!connected) return false;
+
+  if (!params.instance) {
+    await db
+      .update(kiloclaw_composio_identities)
+      .set({ google_calendar_connected_account_id: params.connectedAccountId })
+      .where(eq(kiloclaw_composio_identities.id, identity.row.id));
+    return true;
+  }
 
   // Blocks callbacks after manual mode is recorded. The worker secret write
   // below is cross-service, so a manual save starting concurrently still races
@@ -193,7 +239,6 @@ export async function completeManagedComposioGoogleCalendarConnection(params: {
 
 export async function createManagedComposioGoogleCalendarLink(params: {
   userId: string;
-  instance: ActiveKiloClawInstance;
   scope: ComposioOwnerScope;
   organizationId?: string;
   returnTo: string;
@@ -251,7 +296,11 @@ export async function getManagedComposioGoogleCalendarStatus(params: {
         account.status === 'ACTIVE' &&
         (!knownConnectedAccountId || account.id === knownConnectedAccountId)
     );
-    if (active && params.sandboxHasComposioSecrets && sandboxConfigSource === 'managed') {
+    if (
+      active &&
+      ((!params.instance && knownConnectedAccountId !== null) ||
+        (params.instance && params.sandboxHasComposioSecrets && sandboxConfigSource === 'managed'))
+    ) {
       return {
         enabled: true,
         status: 'connected',
