@@ -10,8 +10,8 @@ import {
 import { encryptApiKey } from '@/lib/ai-gateway/byok/encryption';
 import { BYOK_ENCRYPTION_KEY } from '@/lib/config.server';
 import { ExperimentUpstreamSchema } from '@/lib/ai-gateway/experiments/upstream-schema';
-import { EXPERIMENTED_PUBLIC_IDS_REDIS_KEY, modelExperimentRedisKey } from '@/lib/redis-keys';
-import { redisDel, redisSet } from '@/lib/redis';
+import { EXPERIMENTED_PUBLIC_IDS_REDIS_KEY } from '@/lib/redis-keys';
+import { redisSet } from '@/lib/redis';
 import { TRPCError } from '@trpc/server';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import * as z from 'zod';
@@ -111,7 +111,7 @@ async function applyExperimentTransition(opts: {
       .where(eq(model_experiment.id, opts.id))
       .returning();
     if (!updated) notFound('Experiment');
-    await invalidateExperimentCaches(updated.public_model_id);
+    await refreshExperimentedPublicIdsCache();
     return updated;
   } catch (err) {
     if (isUniqueViolation(err)) {
@@ -124,15 +124,8 @@ async function applyExperimentTransition(opts: {
   }
 }
 
-async function invalidateExperimentCaches(publicModelId: string) {
-  // Per-public-id cache and the membership set are both touched by every
-  // routing-affecting mutation. Best-effort — Redis being down does not block
-  // admin writes.
-  try {
-    await redisDel(modelExperimentRedisKey(publicModelId));
-  } catch {
-    // already captured by redis helper
-  }
+async function refreshExperimentedPublicIdsCache() {
+  // Best-effort — Redis being down does not block admin writes.
   try {
     await recomputeExperimentedPublicIds();
   } catch {
@@ -143,7 +136,7 @@ async function invalidateExperimentCaches(publicModelId: string) {
 // ---- Selectors ----------------------------------------------------------
 
 // NEVER select encrypted_api_key here. Plaintext keys are decrypted only by
-// the gateway-side cache loader (Phase 3); admin reads must not see them.
+// gateway request routing; admin reads must not see them.
 const variantVersionPublicColumns = {
   id: model_experiment_variant_version.id,
   variant_id: model_experiment_variant_version.variant_id,
@@ -371,11 +364,10 @@ export const adminModelExperimentsRouter = createTRPCRouter({
       .set(next)
       .where(eq(model_experiment.id, input.id))
       .returning();
-    // Only routing-relevant edits touch the per-public-id cache; cosmetic
-    // name/description-only changes don't invalidate.
+    // Only routing-relevant edits touch the experimented-public-id cache;
+    // cosmetic name/description-only changes don't refresh it.
     if (existing.public_model_id !== updated.public_model_id) {
-      await invalidateExperimentCaches(updated.public_model_id);
-      await invalidateExperimentCaches(existing.public_model_id);
+      await refreshExperimentedPublicIdsCache();
     }
     return updated;
   }),
@@ -519,7 +511,7 @@ export const adminModelExperimentsRouter = createTRPCRouter({
           created_by: ctx.user.id,
         })
         .returning(variantVersionPublicColumns);
-      await invalidateExperimentCaches(experiment.public_model_id);
+      await refreshExperimentedPublicIdsCache();
       return inserted;
     }),
 
@@ -560,7 +552,7 @@ export const adminModelExperimentsRouter = createTRPCRouter({
         created_by: ctx.user.id,
       })
       .returning(variantVersionPublicColumns);
-    await invalidateExperimentCaches(experiment.public_model_id);
+    await refreshExperimentedPublicIdsCache();
     return inserted;
   }),
 });

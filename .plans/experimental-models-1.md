@@ -10,14 +10,14 @@
     [todo] not started
 -->
 
-| Phase                               | Status        | Notes                                                                                                                                   |
-| ----------------------------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Phase 1 — Schema + Migration        | [done]        | Migration `0134_black_union_jack.sql` in main. PR #3299.                                                                                |
-| Phase 2 — Gateway Header Capture    | [todo]        |                                                                                                                                         |
-| Phase 3 — Variant Picker + Routing  | [todo]        |                                                                                                                                         |
-| Phase 4 — Usage, Metrics, Reporting | [todo]        |                                                                                                                                         |
-| Phase 5 — Admin tRPC + UI           | [in-progress] | Branch `mark/experimental-models-admin`. tRPC router + UI tab landed; `getLiveStats` and `getPromptByHash` deferred to Phase 4/R2 work. |
-| Phase 6 — Specs + Tests             | [todo]        | Spec file `.specs/model-experiments.md` not yet created.                                                                                |
+| Phase                               | Status           | Notes                                                                                                                                                                                |
+| ----------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Phase 1 — Schema + Migration        | [done]           | Migration `0134_black_union_jack.sql` in main. PR #3299.                                                                                                                             |
+| Phase 2 — Gateway Header Capture    | [merged-pending] | Branch `mark/experimental-models-gateway`, PR #3325 (draft).                                                                                                                         |
+| Phase 3 — Variant Picker + Routing  | [merged-pending] | Branch `mark/experimental-models-gateway`, PR #3325 (draft).                                                                                                                         |
+| Phase 4 — Usage, Metrics, Reporting | [in-progress]    | 4a (R2 helper) + 4b (capture/persist) + 4c (after-hook wiring) on PR #3325. 4d (`model_experiment_request_stats` view) intentionally deferred until a real report consumer needs it. |
+| Phase 5 — Admin tRPC + UI           | [in-progress]    | tRPC router + UI tab landed in `#3302`; `getLiveStats` and `getPromptByHash` deferred to follow-up alongside admin UI to inflate prompts.                                            |
+| Phase 6 — Specs + Tests             | [todo]           | Spec file `.specs/model-experiments.md` not yet created.                                                                                                                             |
 
 **Phase 1 — concrete output (landed in `packages/db/src/schema.ts` + `0134_black_union_jack.sql`):**
 
@@ -30,8 +30,47 @@
 **Not yet done in Phase 1 (still owed by future PRs):**
 
 - ~~`ExperimentUpstreamSchema` zod schema (lives in app code, not in `packages/db`).~~ Landed with Phase 5 admin work in `apps/web/src/lib/ai-gateway/experiments/upstream-schema.ts`.
-- The `model_experiment_request_stats` reporting view (Phase 4).
+- The `model_experiment_request_stats` reporting view — explicitly deferred. See Phase 4d note below.
 - Convert `model_experiment_request` to a declarative-partitioned table (range on `created_at`, monthly). Phase 1 landed it as a plain table; partitioning is a follow-up — see "Partitioning (follow-up)" under the schema definition for rationale and conversion mechanics.
+
+**Phase 2 — concrete output (in PR #3325):**
+
+- `apps/web/src/app/api/openrouter/[...path]/route.ts` — extracts `x-kilo-request` into `clientRequestId` and `x-kilo-session` as fallback for `session_id` when `x-kilocode-taskid` is absent. Captures `x-kilocode-machineid` once into `machineIdHeader` and threads it (plus the resolved client IP) into `getProvider`.
+- `apps/web/src/lib/ai-gateway/processUsage.types.ts` — extends `MicrodollarUsageContext` with optional `clientRequestId`, `modelExperimentVariantVersionId`, `modelExperimentAllocationSubject`, and `experimentPromptCapture`. Optional so the dozens of construction sites in routes/tests/helpers don't need touching. Adds `ExperimentPromptCapture` type.
+
+**Phase 3 — concrete output (in PR #3325):**
+
+- `apps/web/src/lib/ai-gateway/experiments/build-direct-provider.ts` — `buildDirectProvider(input)` + `inferSupportedChatApis(...)`. Used by both the new experiment branch and the existing `kilo-internal/...` (custom_llm2) path so direct-to-upstream traffic shares one implementation. Custom_llm passes `extra_headers`; experiments deliberately don't (excluded from `ExperimentUpstreamSchema`).
+- `apps/web/src/lib/ai-gateway/experiments/pick-variant.ts` — `isPublicIdExperimented(publicId)` (Redis membership pre-check with Postgres fallback; returns `unavailable` when both fail), `getRoutingExperimentForPublicId(publicId)` (Redis-cached resolved experiment with a single `SELECT DISTINCT ON (variant_id)` to pick each variant's current version, decrypts `encrypted_api_key` once at cache-build time, returns `none` / `experiment` / `unavailable`), and `pickModelExperimentVariant(input)` (deterministic `getRandomNumber` cumulative-weight walk in id-asc order, allocation subject precedence user → machine → ip; missing all subjects returns `unavailable`).
+- `apps/web/src/lib/ai-gateway/experiments/index.ts` — public exports.
+- `apps/web/src/lib/ai-gateway/providers/get-provider.ts` — refactored to return discriminated `GetProviderResult` (`provider` / `not-found` / `unavailable`). Adds the experiment branch after BYOK and before `kilo-internal/...` and the `kiloExclusiveModels` lookup. Active selections set new flags `skipBalanceCheck`, `skipProviderPin`, `skipKiloExclusiveModelSettings` on the result and attach `experiment` metadata. Custom_llm path refactored to use `buildDirectProvider`.
+- `apps/web/src/app/api/openrouter/[...path]/route.ts` — calls the new `getProvider({...})` signature with `clientIp` + `machineId`, handles `not-found` (local model-unavailable) and `unavailable` (503 temporarily-unavailable) before reading `provider.supportedChatApis`. Honors `skipBalanceCheck` and `skipProviderPin` while still running organization model/data-collection policy. Sets `usageContext.modelExperimentVariantVersionId` + `modelExperimentAllocationSubject` from the result and calls `buildExperimentPromptCapture` after provider transforms for experimented requests only.
+- `apps/web/src/lib/ai-gateway/providers/apply-provider-specific-logic.ts` — accepts an optional options bag with `skipKiloExclusiveModelSettings` so the registry's `internal_id`/provider rewrite doesn't override the variant's upstream. Generic provider-specific request fixes and `provider.transformRequest` still run.
+- `apps/web/src/lib/ai-gateway/auto-model/resolution.ts` — no auto-router changes. `autoFreeModels` and the frontier preset list are hand-curated and don't overlap with experiment preview ids; the explicit-opt-in property is preserved by construction. Avoids paying per-candidate Redis membership checks on every `kilo-auto/free` request.
+
+**Phase 4a–c — concrete output (in PR #3325):**
+
+- `apps/web/src/lib/r2/experiment-prompts.ts` — `putPromptIfAbsent(content)` (HEAD-then-PUT under sha256 hex key for automatic dedup), `getPromptByHash(sha)` (admin out-of-band reads with strict 64-char hex validation), and `sha256Hex(content)`. Throws on R2 errors; callers translate to `__failed__` sentinel.
+- `apps/web/src/lib/r2/client.ts` — adds `R2_EXPERIMENT_PROMPTS_BUCKET_NAME` env var and `r2ExperimentPromptsBucketName` export. Per-environment buckets `kilo-experiment-prompts-dev` / `kilo-experiment-prompts-prod`.
+- `apps/web/src/lib/ai-gateway/experiments/persist.ts` — `buildExperimentPromptCapture(request)` (chat_completions: extracts leading `role: 'system'` message; messages/responses: folds whole body into the body side; both sides tail-truncated at 4 MB with Sentry breadcrumb on truncation). `persistExperimentAttribution(input)` (parallel `Promise.allSettled` R2 puts via `putPromptSafely`, single-row insert into `model_experiment_request` with `__absent__`/`__failed__` sentinels per side; Sentry-reports failures and swallows — best-effort analytics, must not roll back the billing write).
+- `apps/web/src/lib/ai-gateway/processUsage.ts` — `logMicrodollarUsage` and `processTokenData` now return `{ usageId, createdAt }` so the experiment attribution row keys onto the same usage row. Existing callers ignoring the return value are unaffected.
+- `apps/web/src/lib/ai-gateway/llm-proxy-helpers.ts` — `accountForMicrodollarUsage` chains `persistExperimentAttribution` after the microdollar write inside the same `after()` hook, only for experimented requests.
+
+**Phase 4d — explicitly deferred:**
+
+The `model_experiment_request_stats` reporting view was implemented and reverted out of PR #3325 because there is no consumer yet. The two real arguments for the view are (a) centralizing the 4-table join + JSON extraction and (b) physically excluding `upstream->>'api_key'` at the column level so any consumer of the view cannot leak the key. (a) is also achievable inline with Drizzle queries, and (b) can be enforced with a code-review rule + grep test until a real consumer materializes. Re-add when `getLiveStats` (Phase 5 deferred) or another report needs it; by then the right column set will be obvious.
+
+**Stale membership cache — follow-up (next step after PR #3325 lands):**
+
+Surfaced in PR #3325 review. Two compounding issues in the current routing pre-check:
+
+- `EXPERIMENTED_PUBLIC_IDS_REDIS_KEY` is written without a TTL by `recomputeExperimentedPublicIds()` (`apps/web/src/routers/admin/model-experiments-router.ts`), so a stale value persists indefinitely.
+- `isPublicIdExperimented(publicId)` (`apps/web/src/lib/ai-gateway/experiments/pick-variant.ts`) trusts a populated cache absolutely on a "not in list" read; it only falls through to Postgres when Redis returns null or throws.
+- Cache invalidation in the admin router catches and swallows errors.
+
+Failure mode: admin activates an experiment, Postgres write succeeds, Redis recompute fails (network blip), the membership key keeps the previous list. Until another admin mutation succeeds against Redis, every request to the experimented public id silently routes through default routing instead of the experiment.
+
+Fix: add a TTL (e.g. 300s) on `redisSet(EXPERIMENTED_PUBLIC_IDS_REDIS_KEY, …)` so the next reader after expiry gets `null` from Redis, falls through to the existing DB query path, and writes a fresh list. Self-healing with bounded staleness. A "DB fallback when populated cache says no" was considered and rejected — most requests are non-experiment, so per-miss DB queries would defeat the cache's purpose. Targeted test: simulate Redis being unavailable during activate, then a subsequent request after TTL expiry should pick up the experiment via the DB fallback.
 
 **Phase 5 — concrete output (in PR — see status table for branch/PR):**
 
@@ -352,7 +391,7 @@ In `apps/web/src/app/api/openrouter/[...path]/route.ts`:
 Add `apps/web/src/lib/ai-gateway/experiments/`:
 
 - `pick-variant.ts`
-  - `isPublicIdExperimented(publicId)`: fast membership check through helpers added to `apps/web/src/lib/redis-keys.ts` (`EXPERIMENTED_PUBLIC_IDS_REDIS_KEY` / `modelExperimentRedisKey(publicId)`). The membership value contains every `public_model_id` with `status IN ('active', 'paused')`. Used by `getProvider` (see below) as a fast pre-check before the per-public-id fetch, and by the `kilo-auto` candidate-set construction. On Redis error, the function queries Postgres for that `public_model_id` instead of falling through. If both Redis and Postgres are unavailable, return an explicit `unavailable` result so explicit requests to preview experiment ids receive the gateway's "temporarily unavailable" response instead of silently routing as non-experimented traffic.
+  - `isPublicIdExperimented(publicId)`: fast membership check through helpers added to `apps/web/src/lib/redis-keys.ts` (`EXPERIMENTED_PUBLIC_IDS_REDIS_KEY` / `modelExperimentRedisKey(publicId)`). The membership value contains every `public_model_id` with `status IN ('active', 'paused')`. Used by `getProvider` (see below) as a fast pre-check before the per-public-id fetch. On Redis error, the function queries Postgres for that `public_model_id` instead of falling through. If both Redis and Postgres are unavailable, return an explicit `unavailable` result so explicit requests to preview experiment ids receive the gateway's "temporarily unavailable" response instead of silently routing as non-experimented traffic.
   - `getRoutingExperimentForPublicId(publicId)`: returns the routing-relevant experiment with its current status (`active` or `paused`) and resolved variant + version data, `null` when Postgres proves there is no routing-relevant experiment, or `unavailable` when cache/database/config failures prevent a safe routing decision. For each variant, the cached payload contains the current `variant_version_id`, the `upstream` JSONB blob (no key), and the **decrypted** `api_key` merged in alongside as a separate field (in-memory shape: `{ ...upstream, api_key }`). Per-public-id cache at `modelExperimentRedisKey(publicId)`, Redis-cached for 10 minutes. Pre-checks `isPublicIdExperimented` to avoid fetching when no experiment exists. The cache build resolves "current version" per variant via `SELECT DISTINCT ON (variant_id) id, variant_id, upstream, encrypted_api_key, effective_at FROM model_experiment_variant_version WHERE variant_id IN (...) AND effective_at <= now() ORDER BY variant_id, effective_at DESC, id DESC` (Postgres-specific; one query for the experiment, no per-variant round trips), then calls `decryptApiKey(encrypted_api_key, BYOK_ENCRYPTION_KEY)` per row before serialising to Redis. If `BYOK_ENCRYPTION_KEY` is unset for an active/paused experiment, return `unavailable` and log a single warn-level error per process boot.
   - `pickModelExperimentVariant({ publicModelId, userId, machineId, clientIp })`: calls `getRoutingExperimentForPublicId`. Behavior depends on returned experiment status:
     - `active`: pick a variant and return `{ status: 'active', experimentId, variantId, variantVersionId, upstream, allocationSubject }`. If no allocation subject is available (no userId/machineId/clientIp), capture the invariant violation and return `{ status: 'unavailable' }`.
@@ -433,7 +472,7 @@ Integration in `getProvider` (`apps/web/src/lib/ai-gateway/providers/get-provide
 Routing scope:
 
 - Applies only when the request's resolved public id is in the experimented SET. Under Dedicated mode v1 these are dedicated testing public ids (e.g. `kilo/preview-experiment-foo`) that clients select explicitly.
-- `kilo-auto` resolution does not feed experimented public ids: the auto-router's candidate-set construction excludes any public id where `isPublicIdExperimented(publicId)` is true (one-line guard near `applyResolvedAutoModel`). Dedicated testing ids never get silently selected by auto-routing.
+- `kilo-auto` resolution does not feed experimented public ids by construction: `autoFreeModels` and the frontier preset list are hand-curated, and dedicated preview ids are never added to either. No runtime guard is required (and adding one would force per-candidate Redis membership checks on every `kilo-auto/free` request). The invariant lives in code review of those static lists.
 - Does not apply to BYOK requests or `kilo-internal/...` traffic (those branches are matched first / by id prefix and never reach the experiment branch).
 - Balance checks are skipped for experimented preview ids because v1 traffic is free/provider-funded. Server-side organization allow/deny and data-collection policy checks still run against the public model id; direct experiment routing ignores only the provider-pinning side effect because the upstream is selected by the experiment variant.
 - Experimented traffic goes **direct to `upstream.base_url`** — OpenRouter and Vercel are never contacted. No gateway pin needed.
@@ -575,8 +614,56 @@ These constraints exist because of how the gateway is built today. The spec must
 - Identifier-less traffic; under v1 such requests fail closed as temporarily unavailable because missing IP is treated as a gateway invariant violation.
 - A/B variants spanning entirely different public model ids.
 - Client-visible variant ids or variant-aware UI behavior.
+- Response-side rewriting of the served `internal_id` back to the requested `public_id` for experiment traffic — see "Followup: rewrite checkpoint identity in experiment responses" below.
 - Partner trace export, redaction, HMAC webhooks, partner auth, and warehouse coordination (see [Part 2](./experimental-models-2.md)).
 - Replay bundles, SWE-bench/OpenHands adapters, and held-out replay-eval service (see [Part 2](./experimental-models-2.md)).
+
+## Followup: rewrite checkpoint identity in experiment responses
+
+Surfaced in PR #3325 review (P1). Experiment routing rewrites the outbound request to the variant's `upstream.internal_id` (in `buildDirectProvider`, applied via `body.model` before the partner fetch), but the response is returned to the client unchanged.
+
+The existing response-rewriting branch in `apps/web/src/app/api/openrouter/[...path]/route.ts:715,733` only runs for `kilo-exclusive` free traffic flowing through OpenRouter or Vercel — experiment providers carry `provider.id === 'custom'` and bypass it. As a result, OpenAI- and Anthropic-shape partner responses echo `internal_id` in the JSON body and in streaming `model:` events, disclosing the served checkpoint and variant to the client.
+
+This violates the client-blinding requirement from the Accepted Design ("Clients keep sending the same public model id" — line 112) and from the spec ("client blinding" — `Phase 6 — Specs + Tests`). A user could diff response payloads across requests to deduce their bucket assignment and observe checkpoint hot-swaps.
+
+Fix: rewrite `model` back to the requested `public_id` in experiment responses on the way out, mirroring the existing kilo-exclusive rewrite. Both response shapes need coverage:
+
+- Non-streaming JSON: replace `model` in the parsed body before returning.
+- Streaming SSE/event-stream: rewrite the per-chunk `model` field in chat-completions deltas, Anthropic `message_start` / `message_delta` events, and Responses-API `response.created` / `response.completed` events. The existing `rewriteFreeModelResponse_*` helpers in `apps/web/src/lib/ai-gateway/providers/openrouter/responses.ts` (and siblings) already implement this for the gateway-routed path; experiment traffic should reuse the same rewriters keyed on `experiment` rather than provider id, or the predicate at `route.ts:715` should be widened to "rewrite when the served model id differs from the requested public id" so the kilo-exclusive and experiment paths share one rule.
+
+Targeted test: end-to-end an experimented chat-completions and messages request, assert the streamed and final-JSON `model` values match the requested public id and never the variant's `internal_id`.
+
+## Followup: unify direct-upstream routing abstraction
+
+Three routing paths now bypass parts of the OpenRouter policy machinery:
+`custom_llm2`, `direct-byok`, and experiments. Each does so through different
+flags on `GetProviderProviderResult` (`bypassAccessCheck`, `skipProviderPin`,
+`skipKiloExclusiveModelSettings`) and ad-hoc `if (experiment && ...)` policy
+refusals in `route.ts` (data collection, provider allow-list).
+
+The proliferation is a symptom of treating each direct-upstream caller as a
+special case rather than as instances of one abstraction. A followup PR
+should:
+
+- Collapse the per-caller flags into a single notion (e.g. `routingMode:
+'gateway' | 'direct'`) on the provider result. `gateway` flows through
+  OpenRouter/Vercel and accepts the full `body.provider` policy machinery;
+  `direct` does not.
+- Move the policy-refusal points (currently `if (experiment && settings?.data_collection === 'deny')`,
+  `if (experiment && providerConfig?.only !== undefined)`) into a single
+  `checkPolicyEnforcableOnDirect` step that runs for every `direct`-mode
+  request and returns the appropriate refusal when the org has explicit
+  policy that the gateway can't enforce on a direct partner endpoint.
+- Reconsider `custom_llm2`'s `bypassAccessCheck: true`. Today it skips the
+  whole org-restrictions block (per the AI Gateway `AGENTS.md`: "enabling
+  requires explicit admin action, so the org allow-list doesn't apply").
+  That justification holds for per-org admin-enabled custom LLMs but not
+  for globally-routed experiment public ids; the unified abstraction
+  should make that distinction explicit rather than burying it in flag
+  combinations.
+
+This refactor is out of scope for the experiment-routing PR and is tracked
+here so the next PR touching the gateway routing surface can address it.
 
 ## Files Touched
 
