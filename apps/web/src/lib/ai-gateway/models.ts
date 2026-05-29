@@ -31,7 +31,11 @@ import {
   GEMINI_PRO_CURRENT_MODEL_ID,
   gemma_4_26b_a4b_it_free_model,
 } from '@/lib/ai-gateway/providers/google';
-import { alibabaDirectModels, qwen36_plus_model } from '@/lib/ai-gateway/providers/qwen';
+import {
+  alibabaDirectModels,
+  qwen36_plus_model,
+  qwen36_plus_stealth_model,
+} from '@/lib/ai-gateway/providers/qwen';
 import { stepfun_35_flash_free_model } from '@/lib/ai-gateway/providers/stepfun';
 import { isGrokModel } from '@/lib/ai-gateway/providers/xai';
 import { isClaudeModel } from '@/lib/ai-gateway/providers/anthropic.constants';
@@ -62,6 +66,7 @@ export const preferredModels = [
   GEMINI_PRO_CURRENT_MODEL_ID,
   MINIMAX_CURRENT_MODEL_ID,
   qwen36_plus_model.public_id,
+  qwen36_plus_stealth_model.public_id,
   GLM_CURRENT_MODEL_ID,
 ];
 
@@ -86,6 +91,7 @@ export const kiloExclusiveModels = [
   seed_20_code_free_model,
   ...alibabaDirectModels,
   ...deepseekDiscountedModels,
+  qwen36_plus_stealth_model,
   claude_sonnet_clawsetup_model,
   claude_opus_4_7_stealth_model,
   claude_sonnet_4_6_stealth_model,
