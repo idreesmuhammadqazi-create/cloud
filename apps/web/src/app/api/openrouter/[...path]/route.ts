@@ -516,8 +516,7 @@ export async function POST(request: NextRequest): Promise<NextResponseType<unkno
   if (rulesEngineDecision.modelOverride) {
     // Quarantine-3 rewrites non-BYOK requests to an auto-free candidate, so the
     // provider and derived policy flags must be resolved again for that model.
-    const modelBeforeQuarantineOverride = effectiveModelIdLowerCased;
-    abuseDowngradedFrom = modelBeforeQuarantineOverride;
+    abuseDowngradedFrom = effectiveModelIdLowerCased;
     requestBodyParsed.body.model = rulesEngineDecision.modelOverride;
     effectiveModelIdLowerCased = rulesEngineDecision.modelOverride;
     const quarantineProviderResult = await getProvider({
@@ -551,7 +550,7 @@ export async function POST(request: NextRequest): Promise<NextResponseType<unkno
       rules_engine_action: rulesEngineDecision.action,
       rules_engine_matched_abuse_rule_ids:
         classifyResult?.rules_engine?.matched_abuse_rule_ids ?? [],
-      original_model: modelBeforeQuarantineOverride,
+      original_model: abuseDowngradedFrom,
       overridden_model: effectiveModelIdLowerCased,
       original_provider: initialProviderResultForAbuseService.provider.id,
       overridden_provider: effectiveProviderContext.provider.id,
