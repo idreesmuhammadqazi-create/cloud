@@ -30,6 +30,7 @@ type KiloClawClientMock = {
   __getLatestVersionForInstanceMock: AnyMock;
   __patchWebSearchConfigMock: AnyMock;
   __provisionMock: AnyMock;
+  __repairProvisionReservationMock: AnyMock;
   __restartGatewayProcessMock: AnyMock;
   __startMock: AnyMock;
   __stopMock: AnyMock;
@@ -79,6 +80,7 @@ jest.mock('@/lib/kiloclaw/kiloclaw-internal-client', () => {
   const getLatestVersionForInstanceMock = jest.fn();
   const patchWebSearchConfigMock = jest.fn();
   const provisionMock = jest.fn();
+  const repairProvisionReservationMock = (jest.fn() as AnyMock).mockResolvedValue({ ok: true });
   const restartGatewayProcessMock = jest.fn();
   const startMock = jest.fn();
   const stopMock = jest.fn();
@@ -90,6 +92,7 @@ jest.mock('@/lib/kiloclaw/kiloclaw-internal-client', () => {
       getLatestVersionForInstance: getLatestVersionForInstanceMock,
       patchWebSearchConfig: patchWebSearchConfigMock,
       provision: provisionMock,
+      repairProvisionReservation: repairProvisionReservationMock,
       restartGatewayProcess: restartGatewayProcessMock,
       start: startMock,
       stop: stopMock,
@@ -109,6 +112,7 @@ jest.mock('@/lib/kiloclaw/kiloclaw-internal-client', () => {
     __getLatestVersionForInstanceMock: getLatestVersionForInstanceMock,
     __patchWebSearchConfigMock: patchWebSearchConfigMock,
     __provisionMock: provisionMock,
+    __repairProvisionReservationMock: repairProvisionReservationMock,
     __restartGatewayProcessMock: restartGatewayProcessMock,
     __startMock: startMock,
     __stopMock: stopMock,
@@ -129,6 +133,9 @@ jest.mock('@/lib/kiloclaw/kiloclaw-user-client', () => {
 const kiloclawClientMock = jest.requireMock<KiloClawClientMock>(
   '@/lib/kiloclaw/kiloclaw-internal-client'
 );
+const { KiloClawApiError: MockKiloClawApiError } = jest.requireMock<{
+  KiloClawApiError: new (statusCode: number, responseBody: string) => Error;
+}>('@/lib/kiloclaw/kiloclaw-internal-client');
 const kiloclawUserClientMock = jest.requireMock<KiloClawUserClientMock>(
   '@/lib/kiloclaw/kiloclaw-user-client'
 );
@@ -451,6 +458,98 @@ describe('organizations.kiloclaw.provision trial entitlement gate', () => {
     ).rejects.toMatchObject({
       code: 'FORBIDDEN',
       message: 'Organization KiloClaw entitlement has expired.',
+    });
+  });
+
+  it('repairs reservation finalization when an active organization instance already exists', async () => {
+    const user = await insertTestUser({
+      google_user_email: `org-kiloclaw-provision-existing-${crypto.randomUUID()}@example.com`,
+    });
+    const organization = await createOrganization('Org KiloClaw Existing Provision Test', user.id);
+    const instanceId = await createActiveOrgInstance(user.id, organization.id);
+
+    const caller = await createCallerForUser(user.id);
+    await expect(
+      caller.organizations.kiloclaw.provision({ organizationId: organization.id })
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(kiloclawClientMock.__repairProvisionReservationMock).toHaveBeenCalledWith(
+      user.id,
+      instanceId,
+      organization.id
+    );
+  });
+
+  it('surfaces finalization pending when existing organization repair fails', async () => {
+    const user = await insertTestUser({
+      google_user_email: `org-kiloclaw-repair-pending-${crypto.randomUUID()}@example.com`,
+    });
+    const organization = await createOrganization('Org KiloClaw Repair Pending Test', user.id);
+    await createActiveOrgInstance(user.id, organization.id);
+    kiloclawClientMock.__repairProvisionReservationMock.mockRejectedValueOnce(
+      new MockKiloClawApiError(
+        503,
+        JSON.stringify({
+          error: 'Provisioning completed but finalization is pending',
+          code: 'provision_completion_pending',
+        })
+      )
+    );
+
+    const caller = await createCallerForUser(user.id);
+    await expect(
+      caller.organizations.kiloclaw.provision({ organizationId: organization.id })
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: 'Provisioning completed but finalization is pending',
+    });
+  });
+
+  it('maps finalization pending errors during organization config updates', async () => {
+    const user = await insertTestUser({
+      google_user_email: `org-kiloclaw-update-pending-${crypto.randomUUID()}@example.com`,
+    });
+    const organization = await createOrganization('Org KiloClaw Update Pending Test', user.id);
+    await createActiveOrgInstance(user.id, organization.id);
+    kiloclawClientMock.__provisionMock.mockRejectedValueOnce(
+      new MockKiloClawApiError(
+        503,
+        JSON.stringify({
+          error: 'Provisioning completed but finalization is pending',
+          code: 'provision_completion_pending',
+        })
+      )
+    );
+
+    const caller = await createCallerForUser(user.id);
+    await expect(
+      caller.organizations.kiloclaw.updateConfig({ organizationId: organization.id })
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: 'Provisioning completed but finalization is pending',
+    });
+  });
+
+  it('maps Worker fresh-provision admission conflicts', async () => {
+    const user = await insertTestUser({
+      google_user_email: `org-kiloclaw-provision-conflict-${crypto.randomUUID()}@example.com`,
+    });
+    const organization = await createOrganization('Org KiloClaw Provision Conflict Test', user.id);
+    kiloclawClientMock.__provisionMock.mockRejectedValueOnce(
+      new MockKiloClawApiError(
+        409,
+        JSON.stringify({
+          error: 'An instance is already being created. Wait for setup to finish, then try again.',
+          code: 'provision_in_progress',
+        })
+      )
+    );
+
+    const caller = await createCallerForUser(user.id);
+    await expect(
+      caller.organizations.kiloclaw.provision({ organizationId: organization.id })
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: 'An instance is already being created. Wait for setup to finish, then try again.',
     });
   });
 });

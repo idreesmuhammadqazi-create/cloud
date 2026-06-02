@@ -95,6 +95,8 @@ vi.mock('../lib/user-flags', () => ({
 vi.mock('../db', () => ({
   getWorkerDb: vi.fn(() => ({})),
   getActivePersonalInstance: vi.fn().mockResolvedValue(null),
+  getInstanceById: vi.fn().mockResolvedValue(null),
+  getInstanceByIdIncludingDestroyed: vi.fn().mockResolvedValue(null),
   findPepperByUserId: vi.fn().mockResolvedValue({
     id: 'user-1',
     api_token_pepper: 'pepper-1',
@@ -206,10 +208,16 @@ function createFakeStorage() {
       }
       return result;
     },
+    list(): Map<string, unknown> {
+      return new Map(store);
+    },
     put(entries: Record<string, unknown>): void {
       for (const [k, v] of Object.entries(entries)) {
         store.set(k, v);
       }
+    },
+    delete(key: string): void {
+      store.delete(key);
     },
     deleteAll(): void {
       store.clear();
@@ -223,6 +231,22 @@ function createFakeStorage() {
     },
     deleteAlarm(): void {
       alarmTime = null;
+    },
+    async transaction(callback: (txn: unknown) => Promise<unknown>): Promise<unknown> {
+      return await callback({
+        put(entries: Record<string, unknown>): void {
+          for (const [k, v] of Object.entries(entries)) store.set(k, v);
+        },
+        delete(keys: string | string[]): void {
+          for (const key of Array.isArray(keys) ? keys : [keys]) store.delete(key);
+        },
+        setAlarm(time: number): void {
+          alarmTime = time;
+        },
+        deleteAlarm(): void {
+          alarmTime = null;
+        },
+      });
     },
     // Test helpers
     _store: store,
@@ -255,6 +279,15 @@ function createFakeEnv(opts: { includeNorthflank?: boolean } = {}) {
     KILOCLAW_APP: {
       idFromName: vi.fn().mockReturnValue('fake-do-id'),
       get: vi.fn().mockReturnValue(appStub),
+    } as unknown,
+    KILOCLAW_REGISTRY: {
+      idFromName: vi.fn((key: string) => key),
+      get: vi.fn().mockReturnValue({
+        destroyInstance: vi.fn().mockResolvedValue(undefined),
+        finalizeDestroyedInstance: vi.fn().mockResolvedValue(undefined),
+        releaseFreshProvision: vi.fn().mockResolvedValue(undefined),
+        listInstances: vi.fn().mockResolvedValue([]),
+      }),
     } as unknown,
     HYPERDRIVE: { connectionString: 'postgresql://fake' } as unknown,
     AGENT_ENV_VARS_PRIVATE_KEY: 'test-private-key',
@@ -560,6 +593,36 @@ describe('two-phase destroy', () => {
     expect(destroyEvents[0]?.blobs).toEqual(expect.arrayContaining(['manual_user_request']));
   });
 
+  it('does not release an admission reservation during bootstrap cleanup destruction', async () => {
+    const env = createFakeEnv();
+    const registryStub = (env.KILOCLAW_REGISTRY as unknown as { get: Mock }).get('user:user-1') as {
+      finalizeDestroyedInstance: Mock;
+    };
+    const { instance, storage } = createInstance(createFakeStorage(), env);
+    await seedRunning(storage, { sandboxId: 'ki_11111111111141118111111111111111' });
+
+    (flyClient.destroyMachine as Mock).mockResolvedValue(undefined);
+    (flyClient.deleteVolume as Mock).mockResolvedValue(undefined);
+
+    await instance.destroy({ reason: 'bootstrap_cleanup_failure' });
+
+    expect(registryStub.finalizeDestroyedInstance).not.toHaveBeenCalled();
+    expect(storage._store.get('pendingRegistryCleanup')).toEqual(
+      expect.objectContaining({ releaseProvisionReservation: false })
+    );
+
+    await instance.allowProvisionReservationReleaseOnFinalize();
+
+    expect(registryStub.finalizeDestroyedInstance).toHaveBeenCalledWith(
+      'user:user-1',
+      'user-1',
+      '11111111-1111-4111-8111-111111111111',
+      '11111111-1111-4111-8111-111111111111',
+      'instance_destroyed'
+    );
+    expect(storage._store.has('pendingRegistryCleanup')).toBe(false);
+  });
+
   it('keeps pendingDestroyMachineId when machine delete fails', async () => {
     const { instance, storage } = createInstance();
     await seedRunning(storage);
@@ -668,9 +731,11 @@ describe('two-phase destroy', () => {
     await expect(instance.destroy()).resolves.toBeDefined();
   });
 
-  it('alarm retries pending destroy to completion', async () => {
-    const { instance, storage } = createInstance();
+  it('alarm retries pending destroy to completion and releases its provision reservation', async () => {
+    const env = createFakeEnv();
+    const { instance, storage } = createInstance(createFakeStorage(), env);
     await seedProvisioned(storage, {
+      sandboxId: 'ki_11111111111141118111111111111111',
       status: 'destroying',
       flyMachineId: 'machine-1',
       flyVolumeId: 'vol-1',
@@ -706,12 +771,96 @@ describe('two-phase destroy', () => {
     (flyClient.deleteVolume as Mock).mockResolvedValue(undefined);
 
     // Need a fresh instance to re-loadState from storage
-    const { instance: inst2 } = createInstance(storage);
+    const { instance: inst2 } = createInstance(storage, env);
     await inst2.alarm();
 
     // Now fully cleaned up
     expect(storage._store.size).toBe(0);
     expect(storage._getAlarm()).toBeNull();
+    const registryStub = (env.KILOCLAW_REGISTRY as unknown as { get: Mock }).get.mock.results[0]
+      ?.value as { finalizeDestroyedInstance: Mock };
+    expect(registryStub.finalizeDestroyedInstance).toHaveBeenCalledWith(
+      'user:user-1',
+      'user-1',
+      '11111111-1111-4111-8111-111111111111',
+      '11111111-1111-4111-8111-111111111111',
+      'instance_destroyed'
+    );
+  });
+
+  it('releases a pending reservation after alarm sees canonical Postgres destroy confirmation', async () => {
+    const env = createFakeEnv();
+    const registryStub = (env.KILOCLAW_REGISTRY as unknown as { get: Mock }).get('user:user-1') as {
+      finalizeDestroyedInstance: Mock;
+    };
+    const { instance, storage } = createInstance(createFakeStorage(), env);
+    storage._store.set('pendingRegistryCleanup', {
+      userId: 'user-1',
+      orgId: null,
+      sandboxId: 'ki_11111111111141118111111111111111',
+      releaseProvisionReservation: false,
+    });
+    const getWorkerDbSpy = vi.spyOn(db, 'getWorkerDb').mockReturnValue({} as never);
+    const getInstanceByIdSpy = vi.spyOn(db, 'getInstanceById').mockResolvedValue(null as never);
+    const getInstanceByIdIncludingDestroyedSpy = vi
+      .spyOn(db, 'getInstanceByIdIncludingDestroyed')
+      .mockResolvedValue({ id: '11111111-1111-4111-8111-111111111111' } as never);
+
+    await instance.alarm();
+
+    expect(registryStub.finalizeDestroyedInstance).toHaveBeenCalledWith(
+      'user:user-1',
+      'user-1',
+      '11111111-1111-4111-8111-111111111111',
+      '11111111-1111-4111-8111-111111111111',
+      'instance_destroyed'
+    );
+    expect(storage._store.has('pendingRegistryCleanup')).toBe(false);
+    getWorkerDbSpy.mockRestore();
+    getInstanceByIdSpy.mockRestore();
+    getInstanceByIdIncludingDestroyedSpy.mockRestore();
+  });
+
+  it('retries reservation release after alarm-completed destruction if Registry is unavailable', async () => {
+    const env = createFakeEnv();
+    const registryStub = (env.KILOCLAW_REGISTRY as unknown as { get: Mock }).get('user:user-1') as {
+      finalizeDestroyedInstance: Mock;
+    };
+    registryStub.finalizeDestroyedInstance.mockRejectedValueOnce(new Error('registry unavailable'));
+    const { instance, storage } = createInstance(createFakeStorage(), env);
+    await seedProvisioned(storage, {
+      sandboxId: 'ki_11111111111141118111111111111111',
+      status: 'destroying',
+      flyMachineId: 'machine-1',
+      flyVolumeId: 'vol-1',
+      providerState: {
+        provider: 'fly',
+        appName: 'acct-test',
+        machineId: 'machine-1',
+        volumeId: 'vol-1',
+        region: 'iad',
+      },
+      pendingDestroyMachineId: 'machine-1',
+      pendingDestroyVolumeId: 'vol-1',
+    });
+    (flyClient.destroyMachine as Mock).mockResolvedValue(undefined);
+    (flyClient.deleteVolume as Mock).mockResolvedValue(undefined);
+
+    await instance.alarm();
+
+    expect(storage._store.get('pendingRegistryCleanup')).toEqual({
+      userId: 'user-1',
+      orgId: null,
+      sandboxId: 'ki_11111111111141118111111111111111',
+      releaseProvisionReservation: true,
+    });
+    expect(storage._getAlarm()).not.toBeNull();
+
+    const { instance: retryInstance } = createInstance(storage, env);
+    await retryInstance.alarm();
+
+    expect(storage._store.has('pendingRegistryCleanup')).toBe(false);
+    expect(registryStub.finalizeDestroyedInstance).toHaveBeenCalledTimes(2);
   });
 
   it('fully destroys docker-local instances when container and volume deletes succeed', async () => {
@@ -2344,6 +2493,14 @@ describe('status guards', () => {
     await expect(instance.provision('user-1', {})).rejects.toThrow(
       'Cannot provision: instance is being destroyed'
     );
+  });
+
+  it('provision() rejects a wiped explicit instance without fresh admission', async () => {
+    const { instance } = createInstance();
+
+    await expect(
+      instance.provision('user-1', {}, { instanceId: '11111111-1111-4111-8111-111111111111' })
+    ).rejects.toThrow('Instance not provisioned');
   });
 
   it('stop() is a no-op when destroying', async () => {

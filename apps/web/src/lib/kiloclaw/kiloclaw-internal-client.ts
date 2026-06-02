@@ -303,6 +303,21 @@ export class KiloClawInternalClient {
     );
   }
 
+  async repairProvisionReservation(
+    userId: string,
+    instanceId: string,
+    orgId?: string
+  ): Promise<{ ok: true }> {
+    return this.request(
+      '/api/platform/provision/repair-reservation',
+      {
+        method: 'POST',
+        body: JSON.stringify({ userId, instanceId, orgId }),
+      },
+      { userId }
+    );
+  }
+
   async start(
     userId: string,
     instanceId?: string,

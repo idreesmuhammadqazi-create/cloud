@@ -55,7 +55,7 @@ function transaction(
     bundleId: 'com.kilocode.kiloapp',
     productId: 'kilopass.tier19.monthly.v1',
     purchaseDate: 1_777_626_000_000,
-    expiresDate: 1_780_218_000_000,
+    expiresDate: Date.parse('2030-06-01T00:00:00.000Z'),
     environment: 'Sandbox',
     rawPayload: { test: true },
     ...overrides,
@@ -1152,8 +1152,8 @@ describe('processAppStoreKiloPassNotification', () => {
           transactionId: tx1,
           productId: 'kilopass.tier19.monthly.v1',
           appAccountToken: user.app_store_account_token,
-          purchaseDate: Date.parse('2026-05-01T00:00:00.000Z'),
-          expiresDate: Date.parse('2026-05-31T00:00:00.000Z'),
+          purchaseDate: Date.parse('2026-06-01T00:00:00.000Z'),
+          expiresDate: Date.parse('2026-07-01T00:00:00.000Z'),
           currency: 'USD',
           price: 19000,
         }),
@@ -1173,8 +1173,8 @@ describe('processAppStoreKiloPassNotification', () => {
           transactionId: tx2,
           productId: 'kilopass.tier49.monthly.v1',
           appAccountToken: user.app_store_account_token,
-          purchaseDate: Date.parse('2026-05-16T00:00:00.000Z'),
-          expiresDate: Date.parse('2026-06-16T00:00:00.000Z'),
+          purchaseDate: Date.parse('2026-06-16T00:00:00.000Z'),
+          expiresDate: Date.parse('2026-07-16T00:00:00.000Z'),
           currency: 'USD',
           price: 49000,
         }),
@@ -1188,7 +1188,7 @@ describe('processAppStoreKiloPassNotification', () => {
     const issuance = await db.query.kilo_pass_issuances.findFirst({
       where: and(
         eq(kilo_pass_issuances.kilo_pass_subscription_id, subscription?.id ?? ''),
-        eq(kilo_pass_issuances.issue_month, '2026-05-01')
+        eq(kilo_pass_issuances.issue_month, '2026-06-01')
       ),
     });
     expect(issuance).toBeDefined();

@@ -72,11 +72,8 @@ import {
   workerInstanceId,
   type ActiveKiloClawInstance,
 } from '@/lib/kiloclaw/instance-registry';
-import {
-  getPersonalProvisionLockKey,
-  withKiloclawProvisionContextLock,
-} from '@/lib/kiloclaw/provision-lock';
 import { encryptProvisionSecretsForWorker } from '@/lib/kiloclaw/provision-secrets';
+import { handleProvisionError } from '@/lib/kiloclaw/provision-error-handler';
 import {
   clearSubscriptionLifecycleAfterInstanceDestroy,
   clearTrialInactivityStopAfterStart,
@@ -1112,28 +1109,30 @@ async function provisionInstance(
     : undefined;
 
   const client = new KiloClawInternalClient();
-  const result = await client.provision(
-    user.id,
-    {
-      envVars: input.envVars,
-      encryptedSecrets,
-      channels: buildWorkerChannels(input.channels),
-      kilocodeApiKey,
-      kilocodeApiKeyExpiresAt,
-      kilocodeDefaultModel: input.kilocodeDefaultModel ?? undefined,
-      userTimezone: input.userTimezone === undefined ? undefined : input.userTimezone,
-      userLocation: input.userLocation === undefined ? undefined : input.userLocation,
-      pinnedImageTag,
-    },
-    params.instanceId
-      ? {
-          instanceId: params.instanceId,
-          bootstrapSubscription: params.bootstrapSubscription,
-        }
-      : undefined
-  );
-
-  return result;
+  try {
+    return await client.provision(
+      user.id,
+      {
+        envVars: input.envVars,
+        encryptedSecrets,
+        channels: buildWorkerChannels(input.channels),
+        kilocodeApiKey,
+        kilocodeApiKeyExpiresAt,
+        kilocodeDefaultModel: input.kilocodeDefaultModel ?? undefined,
+        userTimezone: input.userTimezone === undefined ? undefined : input.userTimezone,
+        userLocation: input.userLocation === undefined ? undefined : input.userLocation,
+        pinnedImageTag,
+      },
+      params.instanceId
+        ? {
+            instanceId: params.instanceId,
+            bootstrapSubscription: params.bootstrapSubscription,
+          }
+        : undefined
+    );
+  } catch (error) {
+    handleProvisionError(error, getKiloClawApiErrorPayload);
+  }
 }
 
 async function emitProvisionTrialStartSideEffects(params: {
@@ -3273,25 +3272,20 @@ export const kiloclawRouter = createTRPCRouter({
 
   // Explicit lifecycle APIs
   provision: baseProcedure.input(updateConfigSchema).mutation(async ({ ctx, input }) => {
-    return await withKiloclawProvisionContextLock(
-      getPersonalProvisionLockKey(ctx.user.id),
-      async () => {
-        const { instanceId, bootstrapSubscription, shouldEnqueueTrialStartAffiliate } =
-          await ensureProvisionAccess(ctx.user.id, ctx.user.google_user_email);
-        const result = await provisionInstance(ctx.user, input, {
-          instanceId,
-          bootstrapSubscription,
-        });
-        if (shouldEnqueueTrialStartAffiliate) {
-          await emitProvisionTrialStartSideEffects({
-            userId: ctx.user.id,
-            userEmail: ctx.user.google_user_email,
-            instanceId: result.instanceId,
-          });
-        }
-        return result;
-      }
-    );
+    const { instanceId, bootstrapSubscription, shouldEnqueueTrialStartAffiliate } =
+      await ensureProvisionAccess(ctx.user.id, ctx.user.google_user_email);
+    const result = await provisionInstance(ctx.user, input, {
+      instanceId,
+      bootstrapSubscription,
+    });
+    if (shouldEnqueueTrialStartAffiliate) {
+      await emitProvisionTrialStartSideEffects({
+        userId: ctx.user.id,
+        userEmail: ctx.user.google_user_email,
+        instanceId: result.instanceId,
+      });
+    }
+    return result;
   }),
 
   patchConfig: clawAccessProcedure
@@ -3303,25 +3297,20 @@ export const kiloclawRouter = createTRPCRouter({
   // Backward-compatible alias — uses the same trial-bootstrap flow as provision
   // so first-time callers can create a trial row (clawAccessProcedure would reject them).
   updateConfig: baseProcedure.input(updateConfigSchema).mutation(async ({ ctx, input }) => {
-    return await withKiloclawProvisionContextLock(
-      getPersonalProvisionLockKey(ctx.user.id),
-      async () => {
-        const { instanceId, bootstrapSubscription, shouldEnqueueTrialStartAffiliate } =
-          await ensureProvisionAccess(ctx.user.id, ctx.user.google_user_email);
-        const result = await provisionInstance(ctx.user, input, {
-          instanceId,
-          bootstrapSubscription,
-        });
-        if (shouldEnqueueTrialStartAffiliate) {
-          await emitProvisionTrialStartSideEffects({
-            userId: ctx.user.id,
-            userEmail: ctx.user.google_user_email,
-            instanceId: result.instanceId,
-          });
-        }
-        return result;
-      }
-    );
+    const { instanceId, bootstrapSubscription, shouldEnqueueTrialStartAffiliate } =
+      await ensureProvisionAccess(ctx.user.id, ctx.user.google_user_email);
+    const result = await provisionInstance(ctx.user, input, {
+      instanceId,
+      bootstrapSubscription,
+    });
+    if (shouldEnqueueTrialStartAffiliate) {
+      await emitProvisionTrialStartSideEffects({
+        userId: ctx.user.id,
+        userEmail: ctx.user.google_user_email,
+        instanceId: result.instanceId,
+      });
+    }
+    return result;
   }),
 
   updateKiloCodeConfig: clawAccessProcedure
