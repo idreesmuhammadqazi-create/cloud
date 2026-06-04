@@ -8,7 +8,7 @@ import { upstreamRequest } from '@/lib/ai-gateway/providers/upstream-request';
 import { getOpenRouterModels } from '@/lib/ai-gateway/providers/gateway-models-cache';
 import { emitApiMetricsForResponse } from '@/lib/ai-gateway/o11y/api-metrics.server';
 import { accountForMicrodollarUsage } from '@/lib/ai-gateway/llm-proxy-helpers';
-import { redisGet, redisSet } from '@/lib/redis';
+import { redisClient } from '@/lib/redis';
 import type { Provider } from '@/lib/ai-gateway/providers/types';
 
 jest.mock('next/server', () => {
@@ -39,7 +39,9 @@ jest.mock('@/lib/ai-gateway/abuse-service', () => {
 jest.mock('@/lib/ai-gateway/providers/get-provider');
 jest.mock('@/lib/ai-gateway/providers/upstream-request');
 jest.mock('@/lib/ai-gateway/providers/gateway-models-cache');
-jest.mock('@/lib/redis');
+jest.mock('@/lib/redis', () => ({
+  redisClient: { get: jest.fn(), set: jest.fn() },
+}));
 jest.mock('@/lib/ai-gateway/o11y/api-metrics.server', () => ({
   emitApiMetricsForResponse: jest.fn(),
   getToolsAvailable: jest.fn(() => false),
@@ -65,8 +67,8 @@ const mockedUpstreamRequest = jest.mocked(upstreamRequest);
 const mockedGetOpenRouterModels = jest.mocked(getOpenRouterModels);
 const mockedEmitApiMetricsForResponse = jest.mocked(emitApiMetricsForResponse);
 const mockedAccountForMicrodollarUsage = jest.mocked(accountForMicrodollarUsage);
-const mockedRedisGet = jest.mocked(redisGet);
-const mockedRedisSet = jest.mocked(redisSet);
+const mockedRedisGet = jest.mocked(redisClient.get);
+const mockedRedisSet = jest.mocked(redisClient.set);
 
 const provider = {
   id: 'openrouter',
@@ -160,7 +162,7 @@ describe('POST /api/openrouter/v1/chat/completions rules-engine actions', () => 
     });
     mockedClassifyAbuse.mockResolvedValue(classifyResult(null));
     mockedRedisGet.mockResolvedValue(null);
-    mockedRedisSet.mockResolvedValue(true);
+    mockedRedisSet.mockResolvedValue('OK');
     mockedGetOpenRouterModels.mockResolvedValue(
       new Set(['nvidia/nemotron-3-super-120b-a12b:free'])
     );
