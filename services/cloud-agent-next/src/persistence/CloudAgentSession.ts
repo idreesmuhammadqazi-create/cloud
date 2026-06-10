@@ -1926,10 +1926,12 @@ export class CloudAgentSession extends DurableObject<WorkerEnv> {
    */
   async alarm(): Promise<void> {
     const now = Date.now();
+    await this.scheduleAlarmAtOrBefore(now + PENDING_FLUSH_DEBOUNCE_MS);
     const alarmAtStart = await this.ctx.storage.getAlarm();
 
     let pendingFlushRetryAt: number | undefined;
     let remainingPendingCount: number | undefined;
+    let terminalEffectRepairRetryAt: number | undefined;
     let alarmWorkFailed = false;
 
     try {
@@ -1964,6 +1966,7 @@ export class CloudAgentSession extends DurableObject<WorkerEnv> {
       try {
         await this.getMessageSettlementOutbox().repairTerminalEffects();
       } catch (error) {
+        terminalEffectRepairRetryAt = Date.now() + PENDING_FLUSH_DEBOUNCE_MS;
         logger
           .withFields({
             sessionId: this.sessionId,
@@ -2008,6 +2011,9 @@ export class CloudAgentSession extends DurableObject<WorkerEnv> {
       if (alarmWorkFailed) {
         deadlines.push(currentTime + PENDING_FLUSH_DEBOUNCE_MS);
       }
+      if (terminalEffectRepairRetryAt !== undefined) {
+        deadlines.push(terminalEffectRepairRetryAt);
+      }
       if (pendingFlushRetryAt !== undefined) {
         deadlines.push(pendingFlushRetryAt);
       }
@@ -2046,7 +2052,21 @@ export class CloudAgentSession extends DurableObject<WorkerEnv> {
       // reaper retries soon rather than sleeping for an hour.
       nextAlarmAt = Date.now() + REAPER_INTERVAL_MS_DEFAULT;
     }
-    await this.ctx.storage.setAlarm(nextAlarmAt);
+    try {
+      await this.ctx.storage.setAlarm(nextAlarmAt);
+    } catch (error) {
+      logger
+        .withFields({
+          doId: this.ctx.id.toString(),
+          sessionId: this.sessionId,
+          nextAlarmAt,
+          alarmWorkFailed,
+          remainingPendingCount,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .error('Failed to schedule next alarm reaper run');
+      throw error;
+    }
   }
 
   /**
@@ -2054,10 +2074,15 @@ export class CloudAgentSession extends DurableObject<WorkerEnv> {
    * Called during initialization and when session is first created.
    */
   private async ensureAlarmScheduled(): Promise<void> {
+    if (await this.getSessionMessageQueue().requestPendingDrainIfNeeded()) {
+      logger
+        .withFields({ sessionId: this.sessionId })
+        .info('Rearmed pending session message drain during initialization');
+      return;
+    }
     const alarm = await this.ctx.storage.getAlarm();
     if (alarm === null) {
       await this.ctx.storage.setAlarm(Date.now() + this.getReaperIntervalMs());
-      return;
     }
   }
 
