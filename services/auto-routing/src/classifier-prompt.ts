@@ -9,6 +9,18 @@ export type ClassifierMessage = {
   content: string;
 };
 
+const SYSTEM_PROMPT_PREFIX_MAX_LENGTH = 200;
+const USER_PROMPT_PREFIX_MAX_LENGTH = 800;
+
+type ClassifierPromptSummary = {
+  apiKind: NormalizedClassifierInput['apiKind'];
+  systemPromptPrefix: string | null;
+  initialUserPromptPrefix: string | null;
+  latestUserPromptPrefix: string | null;
+  messageCount: number | null;
+  hasTools: boolean;
+};
+
 const classifierAxisKeys = [
   'contextComplexity',
   'reasoningComplexity',
@@ -57,6 +69,21 @@ const compactTaxonomy = {
   axes: Object.fromEntries(classifierAxisKeys.map(axisKey => [axisKey, axisGuide(axisKey)])),
 };
 
+function buildClassifierPromptSummary(input: NormalizedClassifierInput): ClassifierPromptSummary {
+  return {
+    apiKind: input.apiKind,
+    systemPromptPrefix: input.systemPromptPrefix?.slice(0, SYSTEM_PROMPT_PREFIX_MAX_LENGTH) ?? null,
+    initialUserPromptPrefix:
+      input.userPromptPrefix?.slice(0, USER_PROMPT_PREFIX_MAX_LENGTH) ?? null,
+    latestUserPromptPrefix:
+      input.latestUserPromptPrefix && input.latestUserPromptPrefix !== input.userPromptPrefix
+        ? input.latestUserPromptPrefix.slice(0, USER_PROMPT_PREFIX_MAX_LENGTH)
+        : null,
+    messageCount: input.messageCount,
+    hasTools: input.hasTools,
+  };
+}
+
 export function buildClassifierMessages(input: NormalizedClassifierInput): ClassifierMessage[] {
   return [
     {
@@ -67,13 +94,15 @@ export function buildClassifierMessages(input: NormalizedClassifierInput): Class
         'Required keys: taskType, subtaskType, contextComplexity, reasoningComplexity, riskLevel, executionMode, requiresTools, confidence.',
         'Use only the exact string IDs listed in allowedOutputValues. subtaskType must be listed under the selected taskType.',
         'Classify the primary user intent from the request summary, not the requested model.',
+        'initialUserPromptPrefix is the first user turn; latestUserPromptPrefix can redirect or refine the current request.',
+        'If initial and latest user prompts conflict, prefer latestUserPromptPrefix for the current request.',
         `allowedOutputValues: ${JSON.stringify(allowedOutputValues)}`,
         `taxonomyGuide: ${JSON.stringify(compactTaxonomy)}`,
       ].join('\n'),
     },
     {
       role: 'user',
-      content: `Request summary:\n${JSON.stringify(input)}`,
+      content: `Request summary:\n${JSON.stringify(buildClassifierPromptSummary(input))}`,
     },
   ];
 }

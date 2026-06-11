@@ -18,6 +18,11 @@ const SENSITIVE_KEY_PATTERNS = [
   'secret',
   'token',
 ];
+const REDUNDANT_CONTENT_TYPES = new Set([
+  'function_call_output',
+  'tool_call_output',
+  'tool_result',
+]);
 
 export const mirrorPayloadSchema = MirrorPayloadSchema;
 
@@ -85,6 +90,7 @@ export function parseClassifierInput(payload: MirrorPayload): ClassifierInputPar
         requestedModel: parsed.data.model,
         systemPromptPrefix: firstPromptPrefix(parsed.data.messages, 'system'),
         userPromptPrefix: firstPromptPrefix(parsed.data.messages, 'user'),
+        latestUserPromptPrefix: latestPromptPrefix(parsed.data.messages, 'user'),
         messageCount: parsed.data.messages.length,
         hasTools: hasTools(parsed.data.tools),
         stream: parsed.data.stream === true,
@@ -110,6 +116,7 @@ export function parseClassifierInput(payload: MirrorPayload): ClassifierInputPar
         systemPromptPrefix:
           textPrefix(parsed.data.instructions) ?? firstPromptPrefix(inputMessages, 'system'),
         userPromptPrefix: firstPromptPrefix(inputMessages, 'user') ?? inputTextPrefix,
+        latestUserPromptPrefix: latestPromptPrefix(inputMessages, 'user'),
         messageCount: messageCount(parsed.data.input),
         hasTools: hasTools(parsed.data.tools),
         stream: parsed.data.stream === true,
@@ -131,6 +138,7 @@ export function parseClassifierInput(payload: MirrorPayload): ClassifierInputPar
       systemPromptPrefix:
         textPrefix(parsed.data.system) ?? firstPromptPrefix(parsed.data.messages, 'system'),
       userPromptPrefix: firstPromptPrefix(parsed.data.messages, 'user'),
+      latestUserPromptPrefix: latestPromptPrefix(parsed.data.messages, 'user'),
       messageCount: parsed.data.messages.length,
       hasTools: hasTools(parsed.data.tools),
       stream: parsed.data.stream === true,
@@ -166,18 +174,52 @@ function messageCount(input: unknown) {
 }
 
 function firstPromptPrefix(messages: Message[], role: string) {
-  const message = messages.find(item => item.role === role);
-  return textPrefix(message?.content);
+  return promptPrefixes(messages, role)[0] ?? null;
+}
+
+function latestPromptPrefix(messages: Message[], role: string) {
+  const prefixes = promptPrefixes(messages, role);
+  const first = prefixes[0] ?? null;
+  const latest = prefixes.at(-1) ?? null;
+
+  return latest && latest !== first ? latest : null;
+}
+
+function promptPrefixes(messages: Message[], role: string) {
+  return messages.flatMap(item => {
+    if (item.role !== role) {
+      return [];
+    }
+
+    const prefix = textPrefix(item.content);
+    return prefix ? [prefix] : [];
+  });
 }
 
 function textPrefix(value: unknown): string | null {
-  const text = textFromValue(value).replace(/\s+/g, ' ').trim();
+  const text = cleanPromptText(textFromValue(value));
 
   if (text.length === 0) {
     return null;
   }
 
   return text.slice(0, TEXT_PREFIX_MAX_LENGTH);
+}
+
+function cleanPromptText(text: string): string {
+  const taskText = text.match(/<task>\s*([\s\S]*?)\s*<\/task>/i)?.[1] ?? text;
+
+  return taskText
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, ' ')
+    .replace(/<environment_details>[\s\S]*?<\/environment_details>/gi, ' ')
+    .replace(/<file(?:\s[^>]*)?>[\s\S]*?<\/file>/gi, ' ')
+    .replace(/<file_content(?:\s[^>]*)?>[\s\S]*?<\/file_content>/gi, ' ')
+    .replace(/<read_file>[\s\S]*?<\/read_file>/gi, ' ')
+    .replace(/<search_files>[\s\S]*?<\/search_files>/gi, ' ')
+    .replace(/^\[[^\]]+\]\s+Result:\s*/i, ' ')
+    .replace(/\[ERROR\][\s\S]*/i, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function textFromValue(value: unknown): string {
@@ -190,6 +232,10 @@ function textFromValue(value: unknown): string {
   }
 
   if (!isRecord(value)) {
+    return '';
+  }
+
+  if (typeof value.type === 'string' && REDUNDANT_CONTENT_TYPES.has(value.type)) {
     return '';
   }
 
