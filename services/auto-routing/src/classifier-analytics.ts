@@ -17,6 +17,7 @@ type ClassifierAnalyticsParams = {
   classifierDurationMs?: number;
   classifierCostCredits?: number | null;
   bodyBytes?: number;
+  cacheHit?: boolean;
 };
 
 type ClassifierAnalyticsEnv = Pick<Env, 'AUTO_ROUTING_CLASSIFIER_METRICS'>;
@@ -36,12 +37,16 @@ type ClassifierAnalyticsEnv = Pick<Env, 'AUTO_ROUTING_CLASSIFIER_METRICS'>;
  *   blob10  = "1" if classified request requires tools, "0" if not, "" if unknown
  *   blob11  = confidence bucket
  *   blob12  = sessionId, or "" when absent/unavailable
- *   double1 = classifierDurationMs
+ *   double1 = classifier model-call duration ms; forced to 0 for cache hits
+ *             so existing duration queries (which filter double1 > 0) keep
+ *             measuring model calls only — filter on double7, not the 0
+ *             sentinel, to select cache hits
  *   double2 = classifierCostCredits
  *   double3 = confidence, or -1 if unavailable
  *   double4 = messageCount
  *   double5 = "1" if mirrored request includes tools, "0" if not
  *   double6 = mirrored body bytes
+ *   double7 = "1" if the classification was served from cache, "0" if not
  */
 export function writeClassifierMetricsDataPoint(
   env: ClassifierAnalyticsEnv,
@@ -69,12 +74,13 @@ export function writeClassifierMetricsDataPoint(
         params.sessionId ?? '',
       ],
       doubles: [
-        params.classifierDurationMs ?? 0,
+        params.cacheHit ? 0 : (params.classifierDurationMs ?? 0),
         params.classifierCostCredits ?? 0,
         classification?.confidence ?? -1,
         input?.messageCount ?? 0,
         input?.hasTools ? 1 : 0,
         params.bodyBytes ?? 0,
+        params.cacheHit ? 1 : 0,
       ],
     });
   } catch {

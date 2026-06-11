@@ -1,6 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_CLASSIFIER_MODEL } from './classifier-prompt';
-import { CLASSIFIER_MODEL_CONFIG_KEY, getClassifierModel } from './classifier-config';
+import {
+  CLASSIFIER_MODEL_CONFIG_KEY,
+  clearClassifierConfigCache,
+  getClassifierModel,
+} from './classifier-config';
 
 function createKv(value: string | null) {
   const get = vi.fn(async () => value);
@@ -11,6 +15,10 @@ function createKv(value: string | null) {
 }
 
 describe('classifier config', () => {
+  beforeEach(() => {
+    clearClassifierConfigCache();
+  });
+
   it('falls back to the default classifier model when KV has no value', async () => {
     const { get, kv } = createKv(null);
 
@@ -34,5 +42,20 @@ describe('classifier config', () => {
         AUTO_ROUTING_CONFIG: createKv('   ').kv,
       })
     ).resolves.toBe(DEFAULT_CLASSIFIER_MODEL);
+  });
+
+  it('fails closed to the default classifier model when the KV read rejects', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const kv = {
+      get: vi.fn(async () => {
+        throw new Error('KV unavailable');
+      }),
+    } as unknown as KVNamespace;
+
+    await expect(getClassifierModel({ AUTO_ROUTING_CONFIG: kv })).resolves.toBe(
+      DEFAULT_CLASSIFIER_MODEL
+    );
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 });

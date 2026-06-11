@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { clearClassifierConfigCache } from './classifier-config';
 import { app } from './index';
 import { ClassifierRunError } from './model-classifier';
 import type * as ModelClassifierModule from './model-classifier';
@@ -14,6 +15,9 @@ const writeDataPoint = vi.fn();
 const configGet = vi.fn();
 const configPut = vi.fn();
 const analyticsTokenGet = vi.fn();
+const cacheGetEntry = vi.fn();
+const cachePutEntry = vi.fn();
+const cacheIdFromName = vi.fn(() => 'cache-do-id');
 const originalFetch = globalThis.fetch;
 const mockedFetch = vi.fn<typeof globalThis.fetch>();
 
@@ -27,6 +31,10 @@ const env = {
   },
   AUTO_ROUTING_CLASSIFIER_METRICS: {
     writeDataPoint,
+  },
+  AUTO_ROUTING_DECISION_CACHE: {
+    idFromName: cacheIdFromName,
+    get: () => ({ getEntry: cacheGetEntry, putEntry: cachePutEntry }),
   },
   O11Y_CF_ACCOUNT_ID: 'test-account-id',
   O11Y_CF_AE_API_TOKEN: {
@@ -51,16 +59,24 @@ const mockClassifierResult = {
   classification: mockClassification,
 };
 
+// Node-environment tests have no workers ExecutionContext; Hono accepts a
+// substitute so handler code can use c.executionCtx.waitUntil directly.
+const executionCtx = {
+  waitUntil: () => {},
+  passThroughOnException: () => {},
+} as unknown as ExecutionContext;
+
 function request(path: string, init: RequestInit = {}) {
-  return app.request(`https://auto-routing.example.com${path}`, init, env);
+  return app.request(`https://auto-routing.example.com${path}`, init, env, executionCtx);
 }
 
 function localRequest(path: string, init: RequestInit = {}) {
-  return app.request(`http://localhost:8810${path}`, init, env);
+  return app.request(`http://localhost:8810${path}`, init, env, executionCtx);
 }
 
 describe('auto routing worker', () => {
   beforeEach(() => {
+    clearClassifierConfigCache();
     classifyNormalizedInput.mockReset();
     classifyNormalizedInput.mockResolvedValue(mockClassifierResult);
     writeDataPoint.mockReset();
@@ -68,6 +84,10 @@ describe('auto routing worker', () => {
     configPut.mockReset();
     analyticsTokenGet.mockReset();
     analyticsTokenGet.mockResolvedValue('analytics-token');
+    cacheGetEntry.mockReset();
+    cacheGetEntry.mockResolvedValue(null);
+    cachePutEntry.mockReset();
+    cachePutEntry.mockResolvedValue(undefined);
     mockedFetch.mockReset();
     globalThis.fetch = mockedFetch;
   });
@@ -150,20 +170,25 @@ describe('auto routing worker', () => {
         },
       },
     });
-    expect(classifyNormalizedInput).toHaveBeenCalledWith(env, {
-      apiKind: 'chat_completions',
-      requestedModel: 'anthropic/claude-sonnet-4',
-      systemPromptPrefix: 'You classify auto model routing requests.',
-      userPromptPrefix: 'Pick the best model for this request.',
-      latestUserPromptPrefix: null,
-      messageCount: 3,
-      hasTools: true,
-      stream: true,
-      providerHints: {
-        provider: { order: ['anthropic'] },
-        providerOptions: { openrouter: { sort: 'price', apiKey: '[REDACTED]' } },
+    expect(classifyNormalizedInput).toHaveBeenCalledWith(
+      env,
+      {
+        apiKind: 'chat_completions',
+        requestedModel: 'anthropic/claude-sonnet-4',
+        systemPromptPrefix: 'You classify auto model routing requests.',
+        userPromptPrefix: 'Pick the best model for this request.',
+        latestUserPromptPrefix: null,
+        messageCount: 3,
+        hasTools: true,
+        stream: true,
+        providerHints: {
+          provider: { order: ['anthropic'] },
+          providerOptions: { openrouter: { sort: 'price', apiKey: '[REDACTED]' } },
+        },
       },
-    });
+      'google/gemini-2.5-flash-lite',
+      { openrouterSessionId: 'task-123' }
+    );
     expect(writeDataPoint).toHaveBeenCalledWith({
       indexes: ['google/gemini-2.5-flash-lite'],
       blobs: [
@@ -180,9 +205,74 @@ describe('auto routing worker', () => {
         '0.8-1.0',
         'task-123',
       ],
-      doubles: [expect.any(Number), 0.00000123, 0.82, 3, 1, expect.any(Number)],
+      doubles: [expect.any(Number), 0.00000123, 0.82, 3, 1, expect.any(Number), 0],
     });
     expect(infoSpy).not.toHaveBeenCalled();
+  });
+
+  it('serves a cached classification for the session without calling the classifier', async () => {
+    cacheGetEntry.mockResolvedValueOnce(mockClassification);
+
+    const response = await request('/decide', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer classifier-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        path: '/chat/completions',
+        receivedAt: '2026-06-09T10:00:00.000Z',
+        sessionId: 'task-123',
+        headers: {},
+        body: JSON.stringify({
+          model: 'anthropic/claude-sonnet-4',
+          messages: [{ role: 'user', content: 'Pick the best model.' }],
+        }),
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      cost: 0,
+      decision: null,
+      classifierResult: { classification: mockClassification },
+    });
+    expect(cacheIdFromName).toHaveBeenCalledWith('task-123');
+    expect(classifyNormalizedInput).not.toHaveBeenCalled();
+    expect(cachePutEntry).not.toHaveBeenCalled();
+    expect(writeDataPoint).toHaveBeenCalledWith(
+      expect.objectContaining({
+        doubles: [0, 0, mockClassification.confidence, 1, 0, expect.any(Number), 1],
+      })
+    );
+  });
+
+  it('caches fresh classifications for the conversation', async () => {
+    const response = await request('/decide', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer classifier-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        path: '/chat/completions',
+        receivedAt: '2026-06-09T10:00:00.000Z',
+        sessionId: null,
+        headers: {},
+        body: JSON.stringify({
+          model: 'anthropic/claude-sonnet-4',
+          messages: [{ role: 'user', content: 'Pick the best model.' }],
+        }),
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    // Without a session id the conversation key is derived from content.
+    expect(cacheIdFromName).toHaveBeenCalledWith(expect.stringMatching(/^content:[0-9a-f]{16}$/));
+    expect(cachePutEntry).toHaveBeenCalledWith(
+      expect.stringMatching(/^google\/gemini-2\.5-flash-lite:[0-9a-f]{16}$/),
+      expect.objectContaining({ taskType: 'implementation' })
+    );
   });
 
   it('uses a zero cost when the classifier result has no usage cost', async () => {
@@ -349,7 +439,7 @@ describe('auto routing worker', () => {
     expect(writeDataPoint).toHaveBeenCalledWith({
       indexes: ['unknown'],
       blobs: ['unknown', '', '', 'invalid_body', '', '', '', '', '', '', '', ''],
-      doubles: [0, 0, -1, 0, 0, 9],
+      doubles: [0, 0, -1, 0, 0, 9, 0],
     });
   });
 
@@ -378,7 +468,7 @@ describe('auto routing worker', () => {
     expect(classifyNormalizedInput).not.toHaveBeenCalled();
   });
 
-  it('logs classifier fallback results separately from classifier errors', async () => {
+  it('logs fallback decisions with failure diagnostics', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     classifyNormalizedInput.mockResolvedValueOnce({
       ...mockClassifierResult,
@@ -423,15 +513,18 @@ describe('auto routing worker', () => {
     });
     expect(warnSpy).toHaveBeenCalledTimes(1);
     const [logMessage] = warnSpy.mock.calls[0] ?? [];
-    expect(JSON.parse(String(logMessage))).toEqual({
-      event: 'auto_routing_classifier_fallback',
-      reason: 'invalid_output',
+    expect(JSON.parse(String(logMessage))).toMatchObject({
+      event: 'auto_routing_decision',
+      status: 'fallback:invalid_output',
+      cacheHit: false,
+      fallbackReason: 'invalid_output',
       classifierModel: 'google/gemini-2.5-flash-lite',
       requestedModel: 'anthropic/claude-sonnet-4',
       apiKind: 'chat_completions',
       sessionId: 'task-123',
       classifierDurationMs: expect.any(Number),
       classifierCostCredits: 0.00000123,
+      confidence: 0,
       classifierFailureStage: 'invalid_schema',
       classifierSchemaIssueSummary: ['taskType:invalid_value'],
       classifierOutputTopLevelKeys: ['minecraft'],
@@ -475,15 +568,17 @@ describe('auto routing worker', () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
-      cost: 0,
+      cost: 0.00000123,
       decision: null,
       classifierResult: null,
     });
     expect(warnSpy).toHaveBeenCalledTimes(1);
     const [logMessage] = warnSpy.mock.calls[0] ?? [];
     expect(typeof logMessage).toBe('string');
-    expect(JSON.parse(String(logMessage))).toEqual({
-      event: 'auto_routing_classifier_error',
+    expect(JSON.parse(String(logMessage))).toMatchObject({
+      event: 'auto_routing_decision',
+      status: 'classifier_error:invalid_schema',
+      cacheHit: false,
       reason: 'classifier_run_error',
       classifierModel: 'google/gemini-2.5-flash-lite',
       requestedModel: 'anthropic/claude-sonnet-4',
@@ -513,7 +608,7 @@ describe('auto routing worker', () => {
         '',
         '',
       ],
-      doubles: [expect.any(Number), 0.00000123, -1, 1, 0, expect.any(Number)],
+      doubles: [expect.any(Number), 0.00000123, -1, 1, 0, expect.any(Number), 0],
     });
   });
 
@@ -644,6 +739,7 @@ describe('auto routing worker', () => {
             {
               total_requests: 10,
               classified_requests: 8,
+              cached_requests: 6,
               classifier_errors: 1,
               invalid_requests: 1,
               total_cost_credits: 0.0000123,
@@ -715,6 +811,7 @@ describe('auto routing worker', () => {
       summary: {
         totalRequests: 10,
         classifiedRequests: 8,
+        cachedRequests: 6,
         classifierErrors: 1,
         invalidRequests: 1,
         totalCostCredits: 0.0000123,
@@ -765,6 +862,7 @@ describe('auto routing worker', () => {
       summary: {
         totalRequests: 0,
         classifiedRequests: 0,
+        cachedRequests: 0,
         classifierErrors: 0,
         invalidRequests: 0,
         totalCostCredits: 0,
