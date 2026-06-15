@@ -896,14 +896,25 @@ describe('POST /api/internal/code-review-status/[reviewId]', () => {
       );
     });
 
-    it('reclassifies failed model-not-found callbacks as cancelled while preserving the error message', async () => {
+    it('reclassifies failed model-not-found callbacks as cancelled while preserving dashboard diagnostics', async () => {
       mockGetCodeReviewById.mockResolvedValue(makeReview());
       mockFindKiloReviewComment.mockResolvedValue(null);
+      const diagnostics = {
+        requestedModel: 'kilo/retired-model',
+        availableModelCount: 3,
+        availableModels: ['vendor/alpha', 'vendor/beta', 'vendor/gamma'],
+        suggestedModels: ['vendor/alpha', 'vendor/beta'],
+        suggestionSource: 'fuzzy',
+      };
+      const detailedErrorMessage =
+        'Model not found: kilo/retired-model. Available runtime models: 3. Closest matches: vendor/alpha, vendor/beta.';
 
       const response = await POST(
         makeRequest({
           status: 'failed',
-          errorMessage: 'Model not found: kilo/retired-model',
+          cloudAgentSessionId: 'agent_runtime_model_diagnostics',
+          errorMessage: detailedErrorMessage,
+          modelNotFoundRuntimeDiagnostics: diagnostics,
         }),
         makeParams(REVIEW_ID)
       );
@@ -912,7 +923,7 @@ describe('POST /api/internal/code-review-status/[reviewId]', () => {
       expect(mockUpdateCodeReviewAttemptForCallback).toHaveBeenCalledWith(
         expect.objectContaining({
           status: 'cancelled',
-          errorMessage: 'Model not found: kilo/retired-model',
+          errorMessage: detailedErrorMessage,
           terminalReason: 'model_not_found',
         })
       );
@@ -920,10 +931,38 @@ describe('POST /api/internal/code-review-status/[reviewId]', () => {
         REVIEW_ID,
         'cancelled',
         expect.objectContaining({
-          errorMessage: 'Model not found: kilo/retired-model',
+          errorMessage: detailedErrorMessage,
           terminalReason: 'model_not_found',
         })
       );
+      expect(mockCaptureMessage).toHaveBeenCalledTimes(1);
+      expect(mockCaptureMessage).toHaveBeenCalledWith(
+        'Code review runtime model not found',
+        expect.objectContaining({
+          level: 'warning',
+          tags: expect.objectContaining({
+            source: 'code-review-runtime-model-not-found',
+            review_id: REVIEW_ID,
+            cloud_agent_session_id: 'agent_runtime_model_diagnostics',
+          }),
+          extra: expect.objectContaining({
+            requestedModel: 'kilo/retired-model',
+            availableModelCount: 3,
+            availableModels: ['vendor/alpha', 'vendor/beta', 'vendor/gamma'],
+            suggestedModels: ['vendor/alpha', 'vendor/beta'],
+            suggestionSource: 'fuzzy',
+          }),
+        })
+      );
+      const publicOutputs = JSON.stringify({
+        githubCheck: mockUpdateCheckRun.mock.calls,
+        githubSummary: mockCreatePRComment.mock.calls,
+        gitlabStatus: mockSetCommitStatus.mock.calls,
+        gitlabSummary: mockCreateMRNote.mock.calls,
+      });
+      expect(publicOutputs).not.toContain('vendor/alpha');
+      expect(publicOutputs).not.toContain('Available runtime models');
+      expect(publicOutputs).not.toContain('retired-model');
       expect(mockCreateInfraRetryAttemptIfMissing).not.toHaveBeenCalled();
       expect(mockRetryReviewFresh).not.toHaveBeenCalled();
     });
@@ -2168,9 +2207,11 @@ describe('POST /api/internal/code-review-status/[reviewId]', () => {
     it('updates GitHub check runs with actionable cancelled copy', async () => {
       mockGetCodeReviewById.mockResolvedValue(makeReview());
       mockFindKiloReviewComment.mockResolvedValue(null);
+      const detailedErrorMessage =
+        'Model not found: kilo/retired-model. Available runtime models: 3. Closest matches: vendor/alpha, vendor/beta.';
 
       await POST(
-        makeRequest({ status: 'failed', errorMessage: 'Model not found: kilo/retired-model' }),
+        makeRequest({ status: 'failed', errorMessage: detailedErrorMessage }),
         makeParams(REVIEW_ID)
       );
 
@@ -2189,6 +2230,13 @@ describe('POST /api/internal/code-review-status/[reviewId]', () => {
         }),
         'standard'
       );
+      const publicOutputs = JSON.stringify({
+        githubCheck: mockUpdateCheckRun.mock.calls,
+        githubSummary: mockCreatePRComment.mock.calls,
+      });
+      expect(publicOutputs).not.toContain('retired-model');
+      expect(publicOutputs).not.toContain('vendor/alpha');
+      expect(publicOutputs).not.toContain('Available runtime models');
     });
 
     it('updates GitLab commit status with actionable cancelled copy', async () => {
@@ -2196,9 +2244,11 @@ describe('POST /api/internal/code-review-status/[reviewId]', () => {
         makeReview({ platform: 'gitlab', platform_project_id: 42, check_run_id: null })
       );
       mockFindKiloReviewNote.mockResolvedValue(null);
+      const detailedErrorMessage =
+        'Model not found: kilo/retired-model. Available runtime models: 3. Closest matches: vendor/alpha, vendor/beta.';
 
       await POST(
-        makeRequest({ status: 'failed', errorMessage: 'Model not found: kilo/retired-model' }),
+        makeRequest({ status: 'failed', errorMessage: detailedErrorMessage }),
         makeParams(REVIEW_ID)
       );
 
@@ -2212,6 +2262,13 @@ describe('POST /api/internal/code-review-status/[reviewId]', () => {
         }),
         'https://gitlab.com'
       );
+      const publicOutputs = JSON.stringify({
+        gitlabStatus: mockSetCommitStatus.mock.calls,
+        gitlabSummary: mockCreateMRNote.mock.calls,
+      });
+      expect(publicOutputs).not.toContain('retired-model');
+      expect(publicOutputs).not.toContain('vendor/alpha');
+      expect(publicOutputs).not.toContain('Available runtime models');
     });
 
     it('creates the canonical GitHub summary when absent', async () => {
