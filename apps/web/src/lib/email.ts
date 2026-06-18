@@ -79,6 +79,10 @@ export class RawHtml {
 
 type TemplateVars = Record<string, string | RawHtml>;
 
+export function renderNonAutolinkedText(str: string): RawHtml {
+  return new RawHtml(escapeHtml(str).replace(/[/.]/g, '$&&#8203;'));
+}
+
 export function renderTemplate(name: string, vars: TemplateVars): string {
   const templatePath = path.join(process.cwd(), 'src', 'emails', `${name}.html`);
   const html = fs.readFileSync(templatePath, 'utf-8');
@@ -203,7 +207,7 @@ export async function sendOrganizationInviteEmail(
     to: data.to,
     templateName: 'orgInvitation',
     templateVars: {
-      organization_name: data.organizationName,
+      organization_name: renderNonAutolinkedText(data.organizationName),
       inviter_name: data.inviterName,
       accept_invite_url: data.acceptInviteUrl,
     },
