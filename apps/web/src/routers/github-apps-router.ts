@@ -93,6 +93,7 @@ export const githubAppsRouter = createTRPCRouter({
     const pendingApproval = metadata?.pending_approval as Record<string, unknown> | undefined;
     const status = (pendingApproval?.status as string) || null;
     const isInstalled = integration.integration_status === 'active';
+    const modelSlug = (metadata?.model_slug as string | undefined) || null;
 
     return {
       installed: isInstalled,
@@ -113,6 +114,7 @@ export const githubAppsRouter = createTRPCRouter({
         suspendedBy: integration.suspended_by,
         installedAt: integration.installed_at,
         status,
+        modelSlug,
       },
     };
   }),
@@ -325,5 +327,33 @@ export const githubAppsRouter = createTRPCRouter({
       }
 
       return { success: true };
+    }),
+
+  // Update the model used when @kilo-bot responds on this GitHub installation.
+  // For organization-owned installations, the model must satisfy the org's
+  // access policy; disallowed models are rejected by the service.
+  updateModel: baseProcedure
+    .input(
+      z.object({
+        organizationId: z.string().uuid().optional(),
+        modelSlug: z.string(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const owner = await resolveAuthorizedOwner(ctx, input.organizationId);
+      const result = await githubAppsService.updateModel(owner, input.modelSlug);
+
+      if (input.organizationId && result.success) {
+        await createAuditLog({
+          organization_id: input.organizationId,
+          action: 'organization.settings.change',
+          actor_id: ctx.user.id,
+          actor_email: ctx.user.google_user_email,
+          actor_name: ctx.user.google_user_name,
+          message: `Updated GitHub integration model to ${input.modelSlug}`,
+        });
+      }
+
+      return result;
     }),
 });

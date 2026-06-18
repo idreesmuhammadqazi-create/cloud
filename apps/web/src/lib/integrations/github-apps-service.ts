@@ -16,6 +16,14 @@ import {
   fetchGitHubBranches,
   fetchGitHubRepositories,
 } from '@/lib/integrations/platforms/github/adapter';
+import { getOrganizationById } from '@/lib/organizations/organizations';
+import { DEFAULT_BOT_MODEL } from '@/lib/bot/constants';
+import {
+  createAllowPredicateFromRestrictions,
+  hasActiveModelRestrictions,
+} from '@/lib/model-allow.server';
+import { getEffectiveModelRestrictions } from '@/lib/organizations/model-restrictions';
+import { updateIntegrationMetadataForOwner } from '@/lib/integrations/db/platform-integrations';
 
 /**
  * List all integrations for an owner
@@ -285,4 +293,57 @@ export async function listBranches(
   );
 
   return { branches };
+}
+
+/**
+ * Get the model for a GitHub integration.
+ * Reads model_slug from the given installation's metadata, falling back to the
+ * platform default for installations created before model config existed.
+ */
+export async function getModel(owner: Owner): Promise<string | null> {
+  const integration = await getInstallation(owner);
+  if (!integration) {
+    return null;
+  }
+
+  const metadata = integration.metadata as { model_slug?: string } | null;
+  if (metadata?.model_slug) {
+    return metadata.model_slug;
+  }
+
+  // Pre-existing installation without a stored model — resolve a default.
+  return owner.type === 'org' ? DEFAULT_BOT_MODEL : DEFAULT_BOT_MODEL;
+}
+
+/**
+ * Update the model for a GitHub integration.
+ * For organization-owned installations, validates the model against org access policy.
+ */
+export async function updateModel(
+  owner: Owner,
+  modelSlug: string
+): Promise<{ success: boolean; error?: string }> {
+  const integration = await getInstallation(owner);
+
+  if (!integration) {
+    return { success: false, error: 'No GitHub installation found' };
+  }
+
+  // For org integrations, validate the model against org access policy.
+  if (owner.type === 'org') {
+    const organization = await getOrganizationById(owner.id);
+    if (organization) {
+      const restrictions = getEffectiveModelRestrictions(organization);
+      if (hasActiveModelRestrictions(restrictions)) {
+        const isAllowed = createAllowPredicateFromRestrictions(restrictions);
+        if (!(await isAllowed(modelSlug))) {
+          return { success: false, error: 'Model is not allowed by organization policy' };
+        }
+      }
+    }
+  }
+
+  await updateIntegrationMetadataForOwner(owner, 'github', { model_slug: modelSlug });
+
+  return { success: true };
 }

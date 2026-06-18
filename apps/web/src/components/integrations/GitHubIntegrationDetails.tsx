@@ -15,12 +15,14 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import Link from 'next/link';
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTRPC } from '@/lib/trpc/utils';
 import { useUser } from '@/hooks/useUser';
 import { DevAddGitHubInstallationCard } from './DevAddGitHubInstallationCard';
 import { useOrganizationWithMembers } from '@/app/api/organizations/hooks';
+import { ModelCombobox, type ModelOption } from '@/components/shared/ModelCombobox';
+import { useModelSelectorList } from '@/app/api/openrouter/hooks';
 
 type GitHubIntegrationDetailsProps = {
   organizationId?: string;
@@ -132,6 +134,40 @@ export function GitHubIntegrationDetails({
     })
   );
 
+  // Fetch models for the model selector
+  const { data: openRouterModels, isLoading: isLoadingModels } =
+    useModelSelectorList(organizationId);
+
+  const modelOptions = useMemo<ModelOption[]>(() => {
+    return (
+      openRouterModels?.data.map(model => ({
+        id: model.id,
+        name: model.name,
+        isFree: model.isFree,
+        mayTrainOnYourPrompts: model.mayTrainOnYourPrompts,
+      })) ?? []
+    );
+  }, [openRouterModels]);
+
+  const [selectedModel, setSelectedModel] = useState<string>('');
+
+  // Initialize selected model from installation data
+  useEffect(() => {
+    if (installationData?.installation?.modelSlug) {
+      setSelectedModel(installationData.installation.modelSlug);
+    }
+  }, [installationData?.installation?.modelSlug]);
+
+  const updateModel = useMutation(
+    trpc.githubApps.updateModel.mutationOptions({
+      onSuccess: () => {
+        void queryClient.invalidateQueries({
+          queryKey: trpc.githubApps.getInstallation.queryKey(input),
+        });
+      },
+    })
+  );
+
   // Show success/error/pending toasts
   useEffect(() => {
     if (success) {
@@ -229,6 +265,32 @@ export function GitHubIntegrationDetails({
         });
       },
     });
+  };
+
+  const handleModelChange = (modelSlug: string) => {
+    const previousModel = selectedModel;
+    setSelectedModel(modelSlug);
+    updateModel.mutate(
+      { modelSlug, organizationId },
+      {
+        onSuccess: result => {
+          if (result.success) {
+            toast.success('Model updated successfully');
+          } else {
+            setSelectedModel(previousModel);
+            toast.error('Failed to update model', {
+              description: result.error,
+            });
+          }
+        },
+        onError: err => {
+          setSelectedModel(previousModel);
+          toast.error('Failed to update model', {
+            description: err.message,
+          });
+        },
+      }
+    );
   };
 
   if (isLoading) {
@@ -357,6 +419,19 @@ export function GitHubIntegrationDetails({
                     {new Date(installation.installedAt).toLocaleDateString()}
                   </span>
                 </div>
+              </div>
+
+              {/* Model Selection */}
+              <div className="space-y-3 rounded-lg border p-4">
+                <ModelCombobox
+                  label="AI Model"
+                  helperText="Select the AI model used when @kilo-bot responds on this installation."
+                  models={modelOptions}
+                  value={selectedModel}
+                  onValueChange={handleModelChange}
+                  isLoading={isLoadingModels}
+                  placeholder="Select a model"
+                />
               </div>
 
               {/* Actions */}
